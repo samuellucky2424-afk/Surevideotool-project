@@ -6,7 +6,12 @@ export function sessionOrigin(req, res) {
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  const origins = [process.env.APP_ORIGIN, process.env.DESKTOP_APP_ORIGIN].filter(Boolean);
+  // These are the app's fixed production and packaged-renderer origins.
+  // Keep explicit overrides for local development and custom deployments.
+  const origins = [
+    process.env.APP_ORIGIN?.trim() || 'https://surevideotool-project.vercel.app',
+    process.env.DESKTOP_APP_ORIGIN?.trim() || 'http://127.0.0.1:47831',
+  ].map((origin) => origin.replace(/\/+$/, ''));
   const origin = req.headers.origin;
   if (!origin || !origins.includes(origin)) {
     res.status(403).json({ error: 'Origin not allowed. Configure APP_ORIGIN or DESKTOP_APP_ORIGIN.' });

@@ -44,6 +44,40 @@ test('login must be verified and callers cannot impersonate another user', async
   assert.equal(forged.statusCode, 403);
 });
 
+test('the published desktop and website pass preflight without optional origin overrides', async () => {
+  const previousAppOrigin = process.env.APP_ORIGIN;
+  const previousDesktopOrigin = process.env.DESKTOP_APP_ORIGIN;
+  try {
+    delete process.env.APP_ORIGIN;
+    delete process.env.DESKTOP_APP_ORIGIN;
+    const { default: handler } = await import('../api/start-session.ts');
+    for (const origin of ['https://surevideotool-project.vercel.app', 'http://127.0.0.1:47831']) {
+      const res = response();
+      await handler({ method: 'OPTIONS', headers: { origin } }, res);
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.headers['Access-Control-Allow-Origin'], origin);
+      assert.equal(res.headers['Access-Control-Allow-Headers'], 'Content-Type, Authorization');
+      assert.equal(res.headers['Cache-Control'], 'no-store');
+    }
+    for (const origin of ['https://attacker.example', 'http://127.0.0.1:9999', 'null', undefined]) {
+      const res = response();
+      await handler({ method: 'OPTIONS', headers: { origin } }, res);
+      assert.equal(res.statusCode, 403);
+    }
+    process.env.APP_ORIGIN = ' https://custom.example/ ';
+    const res = response();
+    assert.equal(sessionOrigin({ headers: { origin: 'https://custom.example' } }, res), 'https://custom.example');
+    const oldOrigin = response();
+    assert.equal(sessionOrigin({ headers: { origin: 'https://surevideotool-project.vercel.app' } }, oldOrigin), null);
+    assert.equal(oldOrigin.statusCode, 403, 'an explicit override replaces the default');
+  } finally {
+    if (previousAppOrigin === undefined) delete process.env.APP_ORIGIN;
+    else process.env.APP_ORIGIN = previousAppOrigin;
+    if (previousDesktopOrigin === undefined) delete process.env.DESKTOP_APP_ORIGIN;
+    else process.env.DESKTOP_APP_ORIGIN = previousDesktopOrigin;
+  }
+});
+
 test('Morphly requests use fresh idempotency keys and preserve the full opaque response', async () => {
   const requests: any[] = [];
   const payload = { session_id: 's1', client_token: 'opaque-client', session_token: 'opaque-session', balance: { available_credits: 20 } };
