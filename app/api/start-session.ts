@@ -8,6 +8,36 @@ import { normalizeMorphlyModel, validateMorphlyReferenceImage, MORPHLY_EDITING_T
 const CREDITS_PER_SECOND = 2;
 const MAX_BILLABLE_SECONDS = 7200;
 const SESSION_BILLING_GRACE_SECONDS = 20;
+const REALTIME_START_COOLDOWN_MS = 30_000;
+const MAX_PROVIDER_SESSION_AGE_MS = (3600 + 60) * 1000;
+
+function isMissingRateLimitFunction(error) {
+  return ['PGRST202', '42883'].includes(error?.code)
+    || /claim_realtime_start/i.test(error?.message || '');
+}
+
+async function claimRealtimeStart(userId) {
+  const { data: claimed, error } = await supabaseAdmin.rpc('claim_realtime_start', { p_user_id: userId });
+  if (!error) return { claimed: Boolean(claimed), error: null, fallback: false };
+  if (!isMissingRateLimitFunction(error)) return { claimed: false, error, fallback: false };
+
+  // Compatibility path for installations that have not applied the optional
+  // atomic limiter migration yet. A successful Start always creates a session
+  // row, so the existing table can enforce the same user-facing cooldown.
+  const cutoff = new Date(Date.now() - REALTIME_START_COOLDOWN_MS).toISOString();
+  const { data: recentSessions, error: fallbackError } = await supabaseAdmin
+    .from('sessions')
+    .select('id')
+    .eq('user_id', userId)
+    .gte('start_time', cutoff)
+    .order('start_time', { ascending: false })
+    .limit(1);
+  return {
+    claimed: !fallbackError && (recentSessions?.length ?? 0) === 0,
+    error: fallbackError,
+    fallback: true,
+  };
+}
 
 function normalizeCredits(value) {
   const credits = Number(value ?? 0);
@@ -119,12 +149,13 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'M2.5 supports subject_replacement only.', code: 'INVALID_EDITING_TYPE' });
       }
     }
-    const { data: claimed, error: limitError } = await supabaseAdmin.rpc('claim_realtime_start', { p_user_id: userId });
-    if (limitError) return res.status(503).json({ error: 'Session rate limiter is unavailable. Apply the Morphly database migration.' });
+    const { claimed, error: limitError, fallback: rateLimitFallback } = await claimRealtimeStart(userId);
+    if (limitError) return res.status(503).json({ error: 'Session rate limiter is unavailable. Try again later.' });
     if (!claimed) {
       res.setHeader('Retry-After', '30');
       return res.status(429).json({ error: 'Wait 30 seconds before starting another session' });
     }
+    if (rateLimitFallback) console.warn('Using sessions-table realtime start limiter; apply the Morphly migration for atomic claims.');
 
     await logPaymentActivity(supabaseAdmin, {
       event: 'session_start_requested',
@@ -137,7 +168,7 @@ export default async function handler(req, res) {
     const [activeSessionsResult, walletResult] = await Promise.all([
       supabaseAdmin
         .from('sessions')
-        .select('id, start_time, morphly_expires_at')
+        .select('id, start_time')
         .eq('user_id', userId)
         .eq('status', 'active')
         .order('start_time', { ascending: true }),
@@ -156,7 +187,7 @@ export default async function handler(req, res) {
 
     const existingActiveSessions = activeSessionsResult.data ?? [];
     const walletNow = walletResult.data;
-    if (existingActiveSessions.some((session) => new Date(session.morphly_expires_at).getTime() > Date.now())) {
+    if (existingActiveSessions.some((session) => Date.now() - new Date(session.start_time).getTime() < MAX_PROVIDER_SESSION_AGE_MS)) {
       return res.status(409).json({ error: 'An active Morphly session already exists. Stop it before starting again, or wait for its time limit.' });
     }
 
@@ -213,7 +244,6 @@ export default async function handler(req, res) {
       .insert({
         user_id: userId,
         status: 'active',
-        morphly_expires_at: new Date(Date.now() + (maxSeconds + 60) * 1000),
         start_time: new Date(),
         credits_used: 0,
         seconds_used: 0,

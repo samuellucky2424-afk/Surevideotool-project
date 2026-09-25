@@ -108,17 +108,26 @@ test('start route enforces limits, forwards provider failures and rolls back loc
   let failNetwork = false;
   let upstreamBody: any;
   let rateLimitClaims = 0;
+  let rateLimiterUnavailable = false;
+  let recentStarts: any[] = [];
   const payload = { session_id: 'provider-id', session_token: 'opaque-session', client_token: 'opaque-client', expires_at: 'fixture', model: 'morphly-realtime', max_session_seconds: 30, balance: { available_credits: 100 } };
-  admin.rpc = async () => { rateLimitClaims++; return { data: !limited, error: null }; };
+  admin.rpc = async () => {
+    rateLimitClaims++;
+    return rateLimiterUnavailable
+      ? { data: null, error: { code: 'PGRST202', message: 'Could not find claim_realtime_start' } }
+      : { data: !limited, error: null };
+  };
   admin.from = (table: string) => {
     let operation = 'select';
+    let recentStartQuery = false;
     const query: any = {
       select() { return query; }, eq() { return query; }, order() { return query; },
+      gte() { recentStartQuery = true; return query; }, limit() { return query; },
       insert() { operation = 'insert'; return query; },
       update() { updates++; operation = 'update'; return query; },
       single() { return query; }, maybeSingle() { return query; },
       then(resolve: any) {
-        const data = table === 'wallets' ? { credits } : table === 'sessions' ? operation === 'insert' ? { id: 'local-id' } : operation === 'select' ? active : [] : null;
+        const data = table === 'wallets' ? { credits } : table === 'sessions' ? operation === 'insert' ? { id: 'local-id' } : operation === 'select' ? recentStartQuery ? recentStarts : active : [] : null;
         return Promise.resolve({ data, error: null }).then(resolve);
       },
     };
@@ -142,13 +151,18 @@ test('start route enforces limits, forwards provider failures and rolls back loc
     { model: 'M2.5', image_url: 'https://example.com/subject.png', editing_type: 'clothing' },
   ]) assert.equal((await invoke(body)).statusCode, 400);
   assert.equal(rateLimitClaims, 0, 'invalid input must not consume a start attempt');
+  rateLimiterUnavailable = true;
+  recentStarts = [{ id: 'recent' }];
+  assert.equal((await invoke()).statusCode, 429);
+  recentStarts = [];
+  rateLimiterUnavailable = false;
   limited = true;
   assert.equal((await invoke()).statusCode, 429);
   limited = false;
   credits = 0;
   assert.equal((await invoke()).body.allowed, false);
   credits = 100;
-  active = [{ id: 'active', morphly_expires_at: new Date(Date.now() + 60000).toISOString() }];
+  active = [{ id: 'active', start_time: new Date().toISOString() }];
   assert.equal((await invoke()).statusCode, 409);
   active = [];
   assert.equal(upstreamCalls, 0);

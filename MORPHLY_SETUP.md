@@ -17,7 +17,7 @@ M2.5 uploads in this app are limited to **3 MB** so their base64 session request
 
 ## Configure and run
 
-1. Run [supabase/morphly-session-rate-limit.sql](supabase/morphly-session-rate-limit.sql) in the existing Supabase project's SQL editor. This adds a provider expiry column and an atomic per-user limit of one start attempt every 30 seconds. The API fails closed until this migration is applied.
+1. Run [supabase/morphly-session-rate-limit.sql](supabase/morphly-session-rate-limit.sql) in the existing Supabase project's SQL editor. This installs the preferred atomic per-user limit of one start attempt every 30 seconds. Until it is applied, the API safely falls back to checking recent rows in the existing `sessions` table, so streaming setup is not blocked.
 2. Create a Morphly key with `realtime:create`. In Morphly's key settings, allow the exact origins used below. Use the dashboard's **Test Morphly connection** to validate the key without starting a paid stream.
 3. Enter these variables directly in the backend environment (locally, `app/.env`; in production, the hosting environment settings):
 
