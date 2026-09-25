@@ -34,6 +34,17 @@ M2.5 uploads in this app are limited to **3 MB** so their base64 session request
 
 The packaged renderer is now served at `http://127.0.0.1:47831`, because `file://` has an opaque origin. Users will need to sign in again after upgrading. Keep port 47831 available. The installer no longer includes `.env`; public configuration is embedded by Vite at build time. Server secrets are only needed on the hosted backend.
 
+### Vercel build directory
+
+Vite always writes to this repository's `app/dist`, independent of the build working directory. Both supported Vercel roots have a checked-in configuration:
+
+| Vercel Root Directory | Configuration | Output Directory relative to that root |
+| --- | --- | --- |
+| Repository root (blank) | `vercel.json` | `app/dist` |
+| `app` | `app/vercel.json` | `dist` |
+
+Use the configuration for your selected root. Both use `npm run build:app`. A successful Vite build followed by `No Output Directory named "dist" found` indicates the deployment is looking in the wrong directory; check Root Directory and remove stale Build Command/Output Directory overrides. When deploying from `app`, include source files outside the Root Directory so the existing `../shared` imports are available.
+
 ## Session behavior
 
 - Each Start requests up to five minutes, capped further by the app wallet and Morphly's available balance. Camera changes and frozen streams stop the current session; the user explicitly starts the next one. No automatic paid replacement sessions are created.

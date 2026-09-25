@@ -3,7 +3,7 @@
   "version": 2,
   "framework": "vite",
   "buildCommand": "npm run build:app",
-  "outputDirectory": "app/dist",
+  "outputDirectory": "dist",
   "installCommand": "npm ci",
   "functions": {
     "api/**/*.ts": {

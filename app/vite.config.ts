@@ -9,6 +9,10 @@ export default defineConfig(({ mode }) => {
   const apiProxyTarget = env.API_PROXY_TARGET || env.VITE_API_PROXY_TARGET || 'http://localhost:3000';
 
   return {
+    root: __dirname,
+    build: {
+      outDir: path.resolve(__dirname, 'dist'),
+    },
     base: './',
     plugins: [inspectAttr(), react()],
     resolve: {
