@@ -2,6 +2,8 @@
 import { supabaseAdmin, supabaseAdminConfigError } from './supabase.js';
 import { logPaymentActivity } from '../shared/payment-activity-log.js';
 
+import { sessionUser } from '../shared/morphly-session.js';
+
 const CREDITS_PER_SECOND = 2;
 // Hard ceiling: one session can never bill more than 2 hours,
 // protecting users whose app crashed and left an orphaned session.
@@ -90,7 +92,9 @@ export default async function handler(req, res) {
       return res.status(503).json({ success: false, message: supabaseAdminConfigError || 'Supabase admin is not configured' });
     }
 
-    const { userId, sessionId } = req.body;
+    const userId = await sessionUser(req, res, supabaseAdmin);
+    if (!userId) return;
+    const { sessionId } = req.body;
     if (!userId || !sessionId) return res.status(400).json({ success: false, message: 'User ID and session ID are required' });
 
     await logPaymentActivity(supabaseAdmin, {

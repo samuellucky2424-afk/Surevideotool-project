@@ -43,13 +43,6 @@ jobs:
         VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL || secrets.VITE_SUPABASE_URL || vars.SUPABASE_URL || secrets.SUPABASE_URL }}
         VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || vars.VITE_SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY || vars.SUPABASE_ANON_KEY }}
         VITE_API_URL: ${{ vars.VITE_API_URL || secrets.VITE_API_URL }}
-        SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL || vars.VITE_SUPABASE_URL || secrets.VITE_SUPABASE_URL }}
-        SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY || vars.SUPABASE_SERVICE_KEY || vars.SUPABASE_SERVICE_ROLE_KEY }}
-        DECART_API_KEY: ${{ secrets.DECART_API_KEY || vars.DECART_API_KEY }}
-        PAYMENTPOINT_API_KEY: ${{ secrets.PAYMENTPOINT_API_KEY || vars.PAYMENTPOINT_API_KEY }}
-        PAYMENTPOINT_SECRET_KEY: ${{ secrets.PAYMENTPOINT_SECRET_KEY || vars.PAYMENTPOINT_SECRET_KEY || secrets.PAYMENTPOINT_WEBHOOK_SECRET || vars.PAYMENTPOINT_WEBHOOK_SECRET || secrets.PAYMENTPOINT_SECURITY_KEY || vars.PAYMENTPOINT_SECURITY_KEY }}
-        PAYMENTPOINT_BUSINESS_ID: ${{ secrets.PAYMENTPOINT_BUSINESS_ID || vars.PAYMENTPOINT_BUSINESS_ID || secrets.PAYMENTPOINT_API_KEY || vars.PAYMENTPOINT_API_KEY }}
-        PAYMENTPOINT_BANK_CODES: ${{ secrets.PAYMENTPOINT_BANK_CODES || vars.PAYMENTPOINT_BANK_CODES }}
         VITE_PAYMENTPOINT_CHECKOUT_URL: ${{ vars.VITE_PAYMENTPOINT_CHECKOUT_URL || secrets.VITE_PAYMENTPOINT_CHECKOUT_URL || vars.VITE_PAYMENTPOINT_URL || secrets.VITE_PAYMENTPOINT_URL || vars.PAYMENTPOINT_CHECKOUT_URL || secrets.PAYMENTPOINT_CHECKOUT_URL }}
         VITE_PAYMENTPOINT_ACCOUNT_NAME: ${{ vars.VITE_PAYMENTPOINT_ACCOUNT_NAME || secrets.VITE_PAYMENTPOINT_ACCOUNT_NAME || vars.PAYMENTPOINT_ACCOUNT_NAME || secrets.PAYMENTPOINT_ACCOUNT_NAME }}
         VITE_PAYMENTPOINT_ACCOUNT_NUMBER: ${{ vars.VITE_PAYMENTPOINT_ACCOUNT_NUMBER || secrets.VITE_PAYMENTPOINT_ACCOUNT_NUMBER || vars.PAYMENTPOINT_ACCOUNT_NUMBER || secrets.PAYMENTPOINT_ACCOUNT_NUMBER }}
@@ -66,20 +59,9 @@ jobs:
           $env:VITE_SUPABASE_ANON_KEY = $defaultSupabaseAnonKey
         }
 
-        if ([string]::IsNullOrWhiteSpace($env:SUPABASE_URL)) {
-          $env:SUPABASE_URL = $env:VITE_SUPABASE_URL
-        }
-
         $optional = @{
           VITE_SUPABASE_URL = $env:VITE_SUPABASE_URL
           VITE_SUPABASE_ANON_KEY = $env:VITE_SUPABASE_ANON_KEY
-          SUPABASE_URL = $env:SUPABASE_URL
-          SUPABASE_SERVICE_KEY = $env:SUPABASE_SERVICE_KEY
-          DECART_API_KEY = $env:DECART_API_KEY
-          PAYMENTPOINT_API_KEY = $env:PAYMENTPOINT_API_KEY
-          PAYMENTPOINT_SECRET_KEY = $env:PAYMENTPOINT_SECRET_KEY
-          PAYMENTPOINT_BUSINESS_ID = $env:PAYMENTPOINT_BUSINESS_ID
-          PAYMENTPOINT_BANK_CODES = $env:PAYMENTPOINT_BANK_CODES
           VITE_PAYMENTPOINT_CHECKOUT_URL = $env:VITE_PAYMENTPOINT_CHECKOUT_URL
           VITE_PAYMENTPOINT_ACCOUNT_NAME = $env:VITE_PAYMENTPOINT_ACCOUNT_NAME
           VITE_PAYMENTPOINT_ACCOUNT_NUMBER = $env:VITE_PAYMENTPOINT_ACCOUNT_NUMBER
@@ -98,14 +80,7 @@ jobs:
         @(
           "VITE_SUPABASE_URL=$env:VITE_SUPABASE_URL"
           "VITE_SUPABASE_ANON_KEY=$env:VITE_SUPABASE_ANON_KEY"
-          "SUPABASE_URL=$env:SUPABASE_URL"
-          "SUPABASE_SERVICE_KEY=$env:SUPABASE_SERVICE_KEY"
           "VITE_API_URL=$env:VITE_API_URL"
-          "DECART_API_KEY=$env:DECART_API_KEY"
-          "PAYMENTPOINT_API_KEY=$env:PAYMENTPOINT_API_KEY"
-          "PAYMENTPOINT_SECRET_KEY=$env:PAYMENTPOINT_SECRET_KEY"
-          "PAYMENTPOINT_BUSINESS_ID=$env:PAYMENTPOINT_BUSINESS_ID"
-          "PAYMENTPOINT_BANK_CODES=$env:PAYMENTPOINT_BANK_CODES"
           "VITE_PAYMENTPOINT_CHECKOUT_URL=$env:VITE_PAYMENTPOINT_CHECKOUT_URL"
           "VITE_PAYMENTPOINT_ACCOUNT_NAME=$env:VITE_PAYMENTPOINT_ACCOUNT_NAME"
           "VITE_PAYMENTPOINT_ACCOUNT_NUMBER=$env:VITE_PAYMENTPOINT_ACCOUNT_NUMBER"
@@ -117,10 +92,6 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         SUREVIDEOTOOL_NATIVE_BUILD_DIR: ../native-camera/build
-        PAYMENTPOINT_API_KEY: ${{ secrets.PAYMENTPOINT_API_KEY || vars.PAYMENTPOINT_API_KEY }}
-        PAYMENTPOINT_SECRET_KEY: ${{ secrets.PAYMENTPOINT_SECRET_KEY || vars.PAYMENTPOINT_SECRET_KEY || secrets.PAYMENTPOINT_WEBHOOK_SECRET || vars.PAYMENTPOINT_WEBHOOK_SECRET || secrets.PAYMENTPOINT_SECURITY_KEY || vars.PAYMENTPOINT_SECURITY_KEY }}
-        PAYMENTPOINT_BUSINESS_ID: ${{ secrets.PAYMENTPOINT_BUSINESS_ID || vars.PAYMENTPOINT_BUSINESS_ID || secrets.PAYMENTPOINT_API_KEY || vars.PAYMENTPOINT_API_KEY }}
-        PAYMENTPOINT_BANK_CODES: ${{ secrets.PAYMENTPOINT_BANK_CODES || vars.PAYMENTPOINT_BANK_CODES }}
       run: npm run electron:build
 
     - name: Resolve release version
@@ -177,15 +148,7 @@ jobs:
         if (!(Test-Path $bundledCameraDir)) { throw "Missing bundled camera directory: $bundledCameraDir" }
 
         $bundledEnvPath = Join-Path $dir "win-unpacked/resources/.env"
-        if (!(Test-Path $bundledEnvPath)) { throw "Missing bundled env file: $bundledEnvPath" }
-
-        $bundledEnv = Get-Content $bundledEnvPath
-        foreach ($requiredEnv in @("VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY", "VITE_API_URL")) {
-          $line = $bundledEnv | Where-Object { $_ -like "$requiredEnv=*" } | Select-Object -First 1
-          if ([string]::IsNullOrWhiteSpace($line) -or $line -eq "$requiredEnv=") {
-            throw "Bundled release env is missing $requiredEnv"
-          }
-        }
+        if (Test-Path $bundledEnvPath) { throw "Server environment must not be bundled in the desktop release" }
 
         $expectedArtifacts = @(
           "SurevideotoolVirtualCamera.dll",

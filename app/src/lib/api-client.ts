@@ -1,3 +1,5 @@
+import { supabase } from './supabase';
+
 const DEPLOYED_APP_ORIGIN = 'https://surevideotool-project.vercel.app';
 const LOCAL_API_BASE = '/api';
 
@@ -11,7 +13,7 @@ function normalizeApiBase(value?: string | null): string | null {
 }
 
 function isFileProtocol(): boolean {
-  return typeof window !== 'undefined' && window.location.protocol === 'file:';
+  return typeof window !== 'undefined' && (window.location.protocol === 'file:' || Boolean(window.electron));
 }
 
 function getApiBase(): string {
@@ -35,5 +37,8 @@ function withLeadingSlash(path: string): string {
 export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const normalizedPath = withLeadingSlash(path);
   const apiBase = getApiBase();
-  return fetch(`${apiBase}${normalizedPath}`, init);
+  const headers = new Headers(init?.headers);
+  const { data: { session } } = await supabase.auth.getSession();
+  if (session) headers.set('Authorization', `Bearer ${session.access_token}`);
+  return fetch(`${apiBase}${normalizedPath}`, { ...init, headers });
 }

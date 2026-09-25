@@ -15,6 +15,8 @@ import { toast } from 'sonner';
 import { useAuth } from '@/context/AuthContext';
 import { useApp } from '@/context/AppContext';
 import { apiFetch } from '@/lib/api-client';
+import { DEFAULT_MORPHLY_MODEL, MORPHLY_MODELS, type MorphlyModel } from '../../../shared/morphly-models.js';
+import { buildMorphlyControls, buildMorphlyConnectOptions, validateMorphlyImage } from '@/lib/morphly-controls';
 import { CREDITS_PER_SECOND } from '@/lib/billing';
 import { UpdateBanner } from '@/components/UpdateBanner';
 import {
@@ -61,17 +63,21 @@ type RealtimeClientEventMap = {
   error: { message: string };
   generationTick: { seconds: number };
   diagnostic: unknown;
+  balance: MorphlyBalance;
+  lowCredit: { level: string };
+  creditsExhausted: unknown;
 };
 
 interface RealtimeClient {
-  disconnect: () => void;
+  disconnect: () => Promise<void>;
   set: (config: {
     prompt?: string | null;
     enhance?: boolean;
     image?: string | Blob | File | null;
+    editingType?: 'subject_replacement';
   }) => Promise<void>;
   setPrompt: (text: string, options?: { enhance?: boolean }) => Promise<void>;
-  getConnectionState?: () => ConnectionState;
+  getState: () => ConnectionState;
   on: <K extends keyof RealtimeClientEventMap>(
     event: K,
     listener: (data: RealtimeClientEventMap[K]) => void,
@@ -89,6 +95,7 @@ type ReferenceImage = {
 };
 
 type TransformState = {
+  model: MorphlyModel;
   prompt: string;
   enhance: boolean;
   image: File | null;
@@ -130,10 +137,6 @@ const AUTO_UPGRADE_SAMPLES = 10;
 const RESTART_WATCHDOG_INTERVAL_MS = 3000;
 const FREEZE_RESTART_THRESHOLD_MS = 12000;
 const INITIAL_PROMPT_INJECTION_DELAY_MS = 500;
-const INITIAL_RETRY_DELAY_MS = 1000;
-const MAX_RETRY_DELAY_MS = 10000;
-const RESTART_FAILURES_BEFORE_DOWNGRADE = 2;
-const DECART_REALTIME_MODEL = 'lucy-2.1';
 const SUREVIDEOTOOL_CAM_FRAME_WIDTH = 1280;
 const SUREVIDEOTOOL_CAM_FRAME_HEIGHT = 720;
 const SUREVIDEOTOOL_CAM_FRAME_INTERVAL_MS = 1000 / 30;
@@ -151,22 +154,15 @@ function createEmptyStreamMetrics(): StreamMetrics {
 
 function buildTransformSignature(transform: TransformState): string {
   return [
+    transform.model,
     transform.prompt,
     transform.enhance ? 'enhance' : 'base',
     transform.imageSignature ?? 'no-image',
   ].join('|');
 }
 
-function buildRealtimeSessionState(transform: TransformState) {
-  return {
-    prompt: transform.prompt,
-    enhance: transform.enhance,
-    image: transform.image ?? null,
-  };
-}
-
 async function applyRealtimeSessionState(realtimeClient: RealtimeClient, transform: TransformState) {
-  await realtimeClient.set(buildRealtimeSessionState(transform));
+  await realtimeClient.set(buildMorphlyControls(transform.model, transform));
 }
 
 function sleep(ms: number): Promise<void> {
@@ -224,7 +220,7 @@ function getStartSessionErrorToast(error: unknown): string | null {
 
   switch (error.message) {
     case 'Webcam start failed':
-    case 'Decart connection was not established':
+    case 'Morphly connection was not established':
       return null;
     case 'Missing session token':
       return 'Failed to start session: missing AI token';
@@ -233,7 +229,7 @@ function getStartSessionErrorToast(error: unknown): string | null {
   }
 }
 
-function getDecartSdkErrorMessage(error: unknown): string | null {
+function getMorphlySdkErrorMessage(error: unknown): string | null {
   if (error instanceof Error && error.message) {
     return error.message;
   }
@@ -294,8 +290,31 @@ async function apiRequest<T>(endpoint: string, options?: RequestInit): Promise<T
   return response.json();
 }
 
-// Preload the SDK module so it's already cached when the user clicks Start.
-void import('@decartai/sdk');
+type MorphlyBalance = {
+  available_credits?: number;
+  reserved_credits?: number;
+  charged_credits?: number;
+  billable_seconds?: number;
+};
+
+// Load the hosted module at its original URL so relative SDK chunks resolve correctly.
+const MORPHLY_SDK_URL = 'https://morphly.fun/sdk/morphly.js';
+async function loadMorphlySdk(): Promise<{
+  createMorphlyClient: (options: { tokenEndpoint: string; fetch: typeof fetch }) => {
+    realtime: { connect: (stream: MediaStream, options: {
+      model: MorphlyModel; prompt?: string; image?: File | null; enhancePrompt?: boolean;
+      editingType?: 'subject_replacement';
+      audio: boolean; maxSessionSeconds: number;
+      onRemoteStream: (stream: MediaStream) => void;
+    }) => Promise<RealtimeClient> };
+  };
+}> {
+  return import(/* @vite-ignore */ MORPHLY_SDK_URL);
+}
+
+// Retain an unconfirmed stop across dashboard navigation; never store credentials on disk.
+let retainedMorphlySession: RealtimeClient | null = null;
+let retainedLocalSessionId = '';
 
 function Dashboard() {
   const { user } = useAuth();
@@ -303,7 +322,15 @@ function Dashboard() {
   const navigate = useNavigate();
 
   const [isStreaming, setIsStreaming] = useState(false);
+  const [stopPending, setStopPending] = useState(Boolean(retainedMorphlySession || retainedLocalSessionId));
+  const [isStopping, setIsStopping] = useState(false);
+  const [morphlyBalance, setMorphlyBalance] = useState<MorphlyBalance | null>(null);
+  const startInFlightRef = useRef(false);
+  const mountedRef = useRef(true);
+  const stopInFlightRef = useRef(false);
   const [referenceImage, setReferenceImage] = useState<ReferenceImage | null>(null);
+  const [selectedModel, setSelectedModel] = useState<MorphlyModel>(DEFAULT_MORPHLY_MODEL);
+  const selectedModelRef = useRef<MorphlyModel>(DEFAULT_MORPHLY_MODEL);
   const [isLoading, setIsLoading] = useState(false);
   const [cameraDevices, setCameraDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedCameraId, setSelectedCameraId] = useState('');
@@ -321,15 +348,14 @@ function Dashboard() {
   const outputVideoRef = useRef<HTMLVideoElement>(null);
   const webcamSourceStreamRef = useRef<MediaStream | null>(null);
   const webcamStreamRef = useRef<MediaStream | null>(null);
-  const realtimeClientRef = useRef<RealtimeClient | null>(null);
+  const realtimeClientRef = useRef<RealtimeClient | null>(retainedMorphlySession);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const transformSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingTransformRef = useRef<TransformState | null>(null);
   const lastAppliedTransformRef = useRef<TransformState | null>(null);
   const transformInFlightRef = useRef(false);
   const clientSubscriptionsCleanupRef = useRef<(() => void) | null>(null);
-  const sessionTokenRef = useRef('');
-  const sessionIdRef = useRef('');
+  const sessionIdRef = useRef(retainedLocalSessionId);
   const frameCallbackHandleRef = useRef<number | null>(null);
   const lastRemoteFrameAtRef = useRef(0);
   const lastGenerationTickAtRef = useRef(Date.now());
@@ -338,8 +364,6 @@ function Dashboard() {
   const restartInFlightRef = useRef(false);
   const safeStopInFlightRef = useRef(false);
   const sessionEverConnectedRef = useRef(false);
-  const restartRetryDelayRef = useRef(INITIAL_RETRY_DELAY_MS);
-  const restartFailureCountRef = useRef(0);
   const handleStopRef = useRef<((options?: { silent?: boolean }) => Promise<void>) | null>(null);
   const safelyStopSessionRef = useRef<(() => Promise<void>) | null>(null);
   const healthCountersRef = useRef({ poorSamples: 0, healthySamples: 0 });
@@ -922,10 +946,9 @@ function Dashboard() {
     }
   }, []);
 
-  const disconnectFromDecart = useCallback((options?: { skipStateUpdate?: boolean }) => {
+  const disconnectFromMorphly = useCallback(async (options?: { skipStateUpdate?: boolean }) => {
     clearSoftReconnectTimer();
     clearFrameWatchdog();
-    cleanupClientSubscriptions();
     sessionEverConnectedRef.current = false;
 
     if (transformSyncTimerRef.current) {
@@ -938,10 +961,12 @@ function Dashboard() {
     setIsSyncingTransform(false);
 
     if (realtimeClientRef.current) {
-      realtimeClientRef.current.disconnect();
+      await realtimeClientRef.current.disconnect();
       realtimeClientRef.current = null;
+      retainedMorphlySession = null;
     }
 
+    cleanupClientSubscriptions();
     cancelRemoteFrameMonitor();
     lastRemoteFrameAtRef.current = 0;
     hasRemoteFrameRef.current = false;
@@ -962,6 +987,7 @@ function Dashboard() {
   }, [cancelRemoteFrameMonitor, cleanupClientSubscriptions, clearFrameWatchdog, clearSoftReconnectTimer, closeSurevideotoolCamWindow]);
 
   const getDesiredTransformState = useCallback((): TransformState => ({
+    model: selectedModelRef.current,
     prompt: promptRef.current,
     enhance: DEFAULT_ENHANCE,
     image: referenceImageRef.current?.file ?? null,
@@ -1104,7 +1130,7 @@ function Dashboard() {
 
   const flushTransformSync = useCallback(async (nextTransform: TransformState) => {
     const realtimeClient = realtimeClientRef.current;
-    if (!realtimeClient) {
+    if (!realtimeClient || stopInFlightRef.current || !isStreamingRef.current) {
       return;
     }
 
@@ -1130,8 +1156,8 @@ function Dashboard() {
 
       lastAppliedTransformRef.current = nextTransform;
     } catch (error) {
-      console.error('Failed to sync live transformation:', error);
-      toast.error('Live style update stalled. Recovering stream...');
+      console.warn('Morphly transform update failed:', getMorphlySdkErrorMessage(error));
+      toast.error('Morphly could not apply the reference image update. Try selecting the image again.');
     } finally {
       transformInFlightRef.current = false;
       setIsSyncingTransform(false);
@@ -1251,9 +1277,8 @@ function Dashboard() {
     evaluateStreamHealth(stats);
   }, [evaluateStreamHealth, markRemoteFrameFresh]);
 
-  const connectToDecart = useCallback(async (
+  const connectToMorphly = useCallback(async (
     stream: MediaStream,
-    apiToken: string,
     initialTransform: TransformState,
     options?: { isRecovery?: boolean },
   ): Promise<RealtimeClient | null> => {
@@ -1263,26 +1288,39 @@ function Dashboard() {
         updateSurevideotoolCamPlaceholder(getSurevideotoolCamGuideMessage(false));
       }
 
-      const { createDecartClient, models } = await import('@decartai/sdk');
-      const client = createDecartClient({ apiKey: apiToken });
-      const model = models.realtime(DECART_REALTIME_MODEL);
+      const { createMorphlyClient } = await loadMorphlySdk();
+      const client = createMorphlyClient({
+        tokenEndpoint: '/api/start-session',
+        fetch: async (input, init) => {
+          if (input !== '/api/start-session') return fetch(input, init);
+          const response = await apiFetch('/start-session', init);
+          if (response.ok) {
+            const data = await response.clone().json();
+            if (data.allowed === false) throw new Error(data.error || 'Session denied');
+            sessionIdRef.current = data.sessionId || '';
+            retainedLocalSessionId = sessionIdRef.current;
+            if (data.credits !== undefined) setCredits(data.credits);
+          }
+          return response;
+        },
+      });
 
       const realtimeClient = await client.realtime.connect(stream, {
-        model,
+        ...buildMorphlyConnectOptions(initialTransform.model, initialTransform),
         onRemoteStream: (editedStream: MediaStream) => {
           bindOutputStream(
             editedStream,
             options?.isRecovery ? 'Reconnecting Surevideotool cam...' : 'Connecting Surevideotool cam...',
           );
         },
-        initialState: {
-          prompt: {
-            text: initialTransform.prompt,
-            enhance: initialTransform.enhance,
-          },
-          image: initialTransform.image ?? undefined,
-        },
       });
+
+      realtimeClientRef.current = realtimeClient;
+      retainedMorphlySession = realtimeClient;
+      if (!mountedRef.current) {
+        await handleStopRef.current?.({ silent: true });
+        return null;
+      }
 
       // connect() resolving means the WebRTC/WebSocket handshake is complete and
       // initialState has already been applied by the SDK. Do NOT call set() here
@@ -1298,7 +1336,6 @@ function Dashboard() {
       // handlers register) — otherwise the first 'reconnecting' event always triggers a recovery .set().
       let hasSeenConnectedViaHandler = false;
       let wasConnectedBeforeLastReconnect = false;
-      let initialTransformReinforced = false;
 
       const onConnectionChange = (nextState: ConnectionState) => {
         const previousState = connectionStateRef.current;
@@ -1323,25 +1360,7 @@ function Dashboard() {
           hasSeenConnectedViaHandler = true;
           sessionEverConnectedRef.current = true;
           setUiStatus('Live');
-          restartRetryDelayRef.current = INITIAL_RETRY_DELAY_MS;
-          restartFailureCountRef.current = 0;
 
-          if (!initialTransformReinforced) {
-            initialTransformReinforced = true;
-
-            void sleep(INITIAL_PROMPT_INJECTION_DELAY_MS)
-              .then(async () => {
-                if (realtimeClientRef.current !== (realtimeClient as RealtimeClient)) {
-                  return;
-                }
-
-                await applyRealtimeSessionState(realtimeClient as RealtimeClient, initialTransform);
-                lastAppliedTransformRef.current = initialTransform;
-              })
-              .catch((error) => {
-                console.error('Failed to reinforce initial realtime session state:', error);
-              });
-          }
         }
 
         if (nextState === 'disconnected') {
@@ -1364,7 +1383,7 @@ function Dashboard() {
               lastAppliedTransformRef.current = recoveryTransform;
             })
             .catch((error) => {
-              console.error('Failed to reapply realtime session state after reconnect:', error);
+              console.warn('Morphly transform recovery failed:', getMorphlySdkErrorMessage(error));
             });
         }
 
@@ -1379,7 +1398,7 @@ function Dashboard() {
       };
 
       const onError = (error: { message: string }) => {
-        console.error('[Decart] realtime error:', error);
+        toast.error(`Morphly: ${error.message}`);
       };
 
       const onGenerationTick = () => {
@@ -1387,23 +1406,36 @@ function Dashboard() {
         markRemoteFrameFresh();
       };
 
+      const onBalance = (balance: MorphlyBalance) => setMorphlyBalance(balance);
+      const onLowCredit = () => toast.warning('Morphly workspace credits are running low.');
+      const onCreditsExhausted = () => {
+        toast.error('Morphly workspace credits exhausted. Add credits before starting again.');
+        void safelyStopSessionRef.current?.();
+      };
+      realtimeClient.on('balance', onBalance);
+      realtimeClient.on('lowCredit', onLowCredit);
+      realtimeClient.on('creditsExhausted', onCreditsExhausted);
       realtimeClient.on('connectionChange', onConnectionChange);
       realtimeClient.on('stats', onStats);
       realtimeClient.on('error', onError);
       realtimeClient.on('generationTick', onGenerationTick);
 
       clientSubscriptionsCleanupRef.current = () => {
+        realtimeClient.off('balance', onBalance);
+        realtimeClient.off('lowCredit', onLowCredit);
+        realtimeClient.off('creditsExhausted', onCreditsExhausted);
         realtimeClient.off('connectionChange', onConnectionChange);
         realtimeClient.off('stats', onStats);
         realtimeClient.off('error', onError);
         realtimeClient.off('generationTick', onGenerationTick);
       };
 
-      realtimeClientRef.current = realtimeClient as RealtimeClient;
+      realtimeClientRef.current = realtimeClient;
+      retainedMorphlySession = realtimeClient;
       lastAppliedTransformRef.current = initialTransform;
       lastGenerationTickAtRef.current = Date.now();
       resetHealthCounters();
-      setConnectionState(realtimeClient.getConnectionState?.() ?? 'connecting');
+      onConnectionChange(realtimeClient.getState());
       setUiStatus('Live');
       setStreamMetrics(createEmptyStreamMetrics());
       hasRemoteFrameRef.current = false;
@@ -1416,10 +1448,10 @@ function Dashboard() {
 
       return realtimeClient as RealtimeClient;
     } catch (error) {
-      console.error('[Decart] SDK error:', error);
+      // Only surface the message; SDK errors can contain credential-bearing causes.
 
       if (!options?.isRecovery) {
-        const errorMessage = getDecartSdkErrorMessage(error);
+        const errorMessage = getMorphlySdkErrorMessage(error);
         toast.error(
           errorMessage
             ? `Failed to connect to AI: ${errorMessage}`
@@ -1434,65 +1466,21 @@ function Dashboard() {
     cleanupClientSubscriptions,
     clearSoftReconnectTimer,
     getSurevideotoolCamGuideMessage,
+    getDesiredTransformState,
+    markRemoteFrameFresh,
+    setCredits,
     handleRealtimeStats,
     resetHealthCounters,
     updateSurevideotoolCamPlaceholder,
     updateSurevideotoolCamStatus,
   ]);
 
-  const restartRealtimeSession = useCallback(async (
-    reason: string,
-    options?: { immediate?: boolean },
-  ) => {
-    if (!isStreamingRef.current || restartInFlightRef.current || !sessionTokenRef.current) {
-      return;
-    }
-
-    restartInFlightRef.current = true;
-    setUiStatus('Reconnecting...');
-
-    try {
-      if (!options?.immediate) {
-        await sleep(restartRetryDelayRef.current);
-      }
-
-      const existingTrack = webcamSourceStreamRef.current?.getVideoTracks()[0];
-      const currentStream = webcamStreamRef.current && webcamSourceStreamRef.current && existingTrack?.readyState === 'live'
-        ? webcamStreamRef.current
-        : await startWebcam(activeModeRef.current, { forceNewStream: true, silent: true });
-
-      if (!currentStream) {
-        return;
-      }
-
-      disconnectFromDecart({ skipStateUpdate: true });
-
-      const reconnectedClient = await connectToDecart(
-        currentStream,
-        sessionTokenRef.current,
-        getDesiredTransformState(),
-        { isRecovery: true },
-      );
-
-      if (!reconnectedClient) {
-        throw new Error(`Restart failed: ${reason}`);
-      }
-
-      restartRetryDelayRef.current = INITIAL_RETRY_DELAY_MS;
-      restartFailureCountRef.current = 0;
-      setUiStatus('Live');
-    } catch (error) {
-      console.error('[Decart] Restart failed:', error);
-      restartFailureCountRef.current += 1;
-      restartRetryDelayRef.current = Math.min(restartRetryDelayRef.current * 2, MAX_RETRY_DELAY_MS);
-
-      if (restartFailureCountRef.current >= RESTART_FAILURES_BEFORE_DOWNGRADE) {
-        setRuntimeModeCap((currentMode) => downgradeQualityMode(currentMode));
-      }
-    } finally {
-      restartInFlightRef.current = false;
-    }
-  }, [connectToDecart, disconnectFromDecart, getDesiredTransformState, startWebcam]);
+  const restartRealtimeSession = useCallback(async (_reason: string, _options?: { immediate?: boolean }) => {
+    // A new Morphly session incurs new usage. Stop first and require an explicit Start.
+    if (!isStreamingRef.current || stopInFlightRef.current) return;
+    toast.info('Stream interrupted. Stop will be confirmed before you can start again.');
+    await handleStopRef.current?.({ silent: true });
+  }, []);
 
   const safelyStopSession = useCallback(async () => {
     if (safeStopInFlightRef.current) {
@@ -1502,12 +1490,6 @@ function Dashboard() {
     safeStopInFlightRef.current = true;
 
     try {
-      try {
-        realtimeClientRef.current?.disconnect();
-      } catch (error) {
-        console.warn('Failed to disconnect realtime client cleanly:', error);
-      }
-
       await handleStopRef.current?.({ silent: true });
     } finally {
       safeStopInFlightRef.current = false;
@@ -1515,19 +1497,43 @@ function Dashboard() {
   }, []);
 
   const handleStop = useCallback(async (options?: { silent?: boolean }) => {
+    if (stopInFlightRef.current) return;
+    stopInFlightRef.current = true;
+    setIsStopping(true);
+    setIsStreaming(false);
+    setSessionStatus('IDLE');
+    clearFrameWatchdog();
+    clearSoftReconnectTimer();
+    stopVirtualCameraPublisher();
+    stopWebcam();
+    setUiStatus('Stopping Morphly...');
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    let upstreamStopPending = false;
     try {
-      if (sessionTokenRef.current) {
+      await disconnectFromMorphly();
+    } catch {
+      upstreamStopPending = true;
+    }
+    try {
+      if (sessionIdRef.current) {
         const response = await apiRequest<{ remainingCredits?: number }>('/end-session', {
           method: 'POST',
           body: JSON.stringify({ userId: user?.id, sessionId: sessionIdRef.current }),
         });
 
-        if (response.remainingCredits !== undefined) {
+        if (typeof response.remainingCredits === 'number') {
           setCredits(response.remainingCredits);
         }
       }
     } catch (error) {
-      console.error('Stop session error:', error);
+      setStopPending(true);
+      setUiStatus('Could not close the app session. Retry Stop.');
+      setIsStopping(false);
+      stopInFlightRef.current = false;
+      return;
     }
 
     if (pollIntervalRef.current) {
@@ -1537,19 +1543,28 @@ function Dashboard() {
 
     stopVirtualCameraPublisher();
 
-    sessionTokenRef.current = '';
     sessionIdRef.current = '';
-    restartRetryDelayRef.current = INITIAL_RETRY_DELAY_MS;
-    restartFailureCountRef.current = 0;
+    retainedLocalSessionId = '';
+    if (upstreamStopPending) {
+      setStopPending(true);
+      setIsStreaming(false);
+      setSessionStatus('IDLE');
+      setUiStatus('Morphly stop unconfirmed. Retry Stop.');
+      setIsStopping(false);
+      stopInFlightRef.current = false;
+      return;
+    }
     setRuntimeModeCap('hd');
     resetHealthCounters();
     clearSoftReconnectTimer();
     clearFrameWatchdog();
-    disconnectFromDecart();
     stopWebcam();
     setIsStreaming(false);
     setSessionStatus('IDLE');
-    setUiStatus('Disconnected');
+    setUiStatus('Stopped. Morphly usage settlement may still be pending.');
+    setStopPending(false);
+    setIsStopping(false);
+    stopInFlightRef.current = false;
 
     if (!options?.silent) {
       toast.info('Session stopped');
@@ -1557,7 +1572,7 @@ function Dashboard() {
   }, [
     clearFrameWatchdog,
     clearSoftReconnectTimer,
-    disconnectFromDecart,
+    disconnectFromMorphly,
     resetHealthCounters,
     setCredits,
     setSessionStatus,
@@ -1620,23 +1635,27 @@ function Dashboard() {
     }
   }, [selectedCameraId]);
 
-  useEffect(() => () => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-    }
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
 
-    if (transformSyncTimerRef.current) {
-      clearTimeout(transformSyncTimerRef.current);
-    }
+      if (transformSyncTimerRef.current) {
+        clearTimeout(transformSyncTimerRef.current);
+      }
 
-    clearSoftReconnectTimer();
-    clearFrameWatchdog();
-    cleanupClientSubscriptions();
-    cancelRemoteFrameMonitor();
-    closeSurevideotoolCamWindow({ clearStream: true });
-    realtimeClientRef.current?.disconnect();
-    webcamStreamRef.current?.getTracks().forEach((track) => track.stop());
-    webcamSourceStreamRef.current?.getTracks().forEach((track) => track.stop());
+      clearSoftReconnectTimer();
+      clearFrameWatchdog();
+      cleanupClientSubscriptions();
+      cancelRemoteFrameMonitor();
+      closeSurevideotoolCamWindow({ clearStream: true });
+      void handleStopRef.current?.({ silent: true });
+      webcamStreamRef.current?.getTracks().forEach((track) => track.stop());
+      webcamSourceStreamRef.current?.getTracks().forEach((track) => track.stop());
+    };
   }, [cancelRemoteFrameMonitor, cleanupClientSubscriptions, clearFrameWatchdog, clearSoftReconnectTimer, closeSurevideotoolCamWindow]);
 
   useEffect(() => {
@@ -1682,7 +1701,7 @@ function Dashboard() {
   }, [clearFrameWatchdog, isStreaming]);
 
   useEffect(() => {
-    if (!isStreaming) {
+    if (!isStreaming || stopPending || isStopping) {
       clearSoftReconnectTimer();
       return;
     }
@@ -1698,7 +1717,7 @@ function Dashboard() {
     }
 
     return undefined;
-  }, [clearSoftReconnectTimer, connectionState, isStreaming, safelyStopSession]);
+  }, [clearSoftReconnectTimer, connectionState, isStreaming, stopPending, isStopping, safelyStopSession]);
 
   useEffect(() => {
     if (!isStreaming) {
@@ -1715,10 +1734,10 @@ function Dashboard() {
 
       const now = Date.now();
       const generationLag = now - lastGenerationTickAtRef.current;
-      const frameLag = now - lastRemoteFrameAtRef.current;
+      const frameLag = performance.now() - lastRemoteFrameAtRef.current;
 
       if (generationLag > FREEZE_RESTART_THRESHOLD_MS && frameLag > FREEZE_RESTART_THRESHOLD_MS) {
-        console.warn('Stream frozen. Restarting realtime session...');
+        console.warn('Stream frozen. Stopping Morphly session.');
         void restartRealtimeSession('generation-tick-watchdog');
       }
     }, RESTART_WATCHDOG_INTERVAL_MS);
@@ -1742,6 +1761,7 @@ function Dashboard() {
     }
 
     queueTransformSync({
+      model: selectedModelRef.current,
       prompt,
       enhance: DEFAULT_ENHANCE,
       image: referenceImage?.file ?? null,
@@ -1784,31 +1804,26 @@ function Dashboard() {
       return;
     }
 
-    void (async () => {
-      const stream = await startWebcam(activeMode, {
-        forceNewStream: true,
-        silent: true,
-      });
-
-      if (stream) {
-        await restartRealtimeSession('camera-switched', { immediate: true });
-      }
-
-      userInitiatedCameraChangeRef.current = false;
-    })();
-  }, [activeMode, isStreaming, restartRealtimeSession, selectedCameraId, startWebcam]);
+    // Switching camera ends the current metered session before the next explicit Start.
+    void restartRealtimeSession('camera-switched', { immediate: true });
+    userInitiatedCameraChangeRef.current = false;
+  }, [isStreaming, restartRealtimeSession, selectedCameraId]);
 
   const handleStart = async () => {
+    if (startInFlightRef.current || stopInFlightRef.current || isStreaming || stopPending || retainedMorphlySession || retainedLocalSessionId) return;
     if (!user?.id) {
       toast.error('Please sign in before starting a live stream.');
       return;
     }
 
-    if (!referenceImageRef.current?.file) {
-      toast.error('Upload a garment reference image before starting.');
+    const imageError = validateMorphlyImage(selectedModelRef.current, referenceImageRef.current?.file ?? null);
+    if (imageError) {
+      toast.error(imageError);
       return;
     }
 
+    startInFlightRef.current = true;
+    setMorphlyBalance(null);
     setIsLoading(true);
     setConnectionState('connecting');
     setUiStatus('Preparing camera...');
@@ -1816,7 +1831,7 @@ function Dashboard() {
     resetHealthCounters();
 
     try {
-      // The virtual camera must be ready before we create a backend/Decart session.
+      // The virtual camera must be ready before we create a backend/Morphly session.
       // Otherwise users can be charged upstream while the camera output cannot be used.
       surevideotoolCamWindowEnabledRef.current = true;
       const virtualCameraStartResult = window.electron
@@ -1838,48 +1853,13 @@ function Dashboard() {
       }
 
       setUiStatus('Connecting...');
-      const startResponse = await apiRequest<{
-        allowed: boolean;
-        token?: string;
-        error?: string;
-        credits?: number;
-        maxSeconds?: number;
-        sessionId?: string;
-      }>('/start-session', {
-        method: 'POST',
-        body: JSON.stringify({ userId: user?.id }),
-      });
-
-      if (!startResponse.allowed) {
-        toast.error(startResponse.error || 'Insufficient credits');
-        stopVirtualCameraPublisher();
-        stopWebcam();
-        closeSurevideotoolCamWindow({ clearStream: true });
-        setIsLoading(false);
-        return;
-      }
-
-      if (startResponse.credits !== undefined) {
-        setCredits(startResponse.credits);
-      }
-
-      const sessionToken = startResponse.token || '';
-
-      if (!sessionToken) {
-        throw new Error('Missing session token');
-      }
-
-      sessionTokenRef.current = sessionToken;
-      sessionIdRef.current = startResponse.sessionId || '';
-
-      const realtimeClient = await connectToDecart(
+      const realtimeClient = await connectToMorphly(
         stream,
-        sessionToken,
         getDesiredTransformState(),
       );
 
       if (!realtimeClient) {
-        throw new Error('Decart connection was not established');
+        throw new Error('Morphly connection was not established');
       }
 
       if (pollIntervalRef.current) {
@@ -1893,30 +1873,20 @@ function Dashboard() {
 
       toast.success('Surevideotool camera is live. Select "Surevideotool" in WhatsApp, Zoom, or OBS.');
     } catch (error) {
-      console.error('Start session error:', error);
+      // Avoid logging SDK response objects or credentials.
       const toastMessage = getStartSessionErrorToast(error);
       if (toastMessage) {
         toast.error(toastMessage);
       }
 
-      if (sessionTokenRef.current) {
-        await apiRequest('/end-session', {
-          method: 'POST',
-          body: JSON.stringify({ userId: user?.id, sessionId: sessionIdRef.current }),
-        }).catch((rollbackError) => {
-          console.error('Failed to roll back session start:', rollbackError);
-        });
-      }
-
-      sessionTokenRef.current = '';
-      stopVirtualCameraPublisher();
-      stopWebcam();
-      disconnectFromDecart();
+      await handleStop({ silent: true });
+      if (realtimeClientRef.current || sessionIdRef.current) return;
       closeSurevideotoolCamWindow({ clearStream: true });
       setIsStreaming(false);
       setSessionStatus('IDLE');
       setUiStatus('Disconnected');
     } finally {
+      startInFlightRef.current = false;
       setIsLoading(false);
     }
   };
@@ -1926,6 +1896,12 @@ function Dashboard() {
     event.target.value = '';
 
     if (!file) {
+      return;
+    }
+
+    const imageError = validateMorphlyImage(selectedModelRef.current, file);
+    if (imageError) {
+      toast.error(imageError);
       return;
     }
 
@@ -2020,7 +1996,7 @@ function Dashboard() {
               <LoaderCircle className="h-4 w-4 animate-spin" />
               <span>
                 {isSyncingTransform
-                  ? 'Applying prompt/image changes without reconnecting...'
+                  ? 'Applying reference image changes...'
                   : connectionState === 'reconnecting'
                     ? 'Reconnecting stream...'
                     : 'Preparing realtime output...'}
@@ -2040,11 +2016,40 @@ function Dashboard() {
         )}
       </main>
 
+      <div role="status" aria-live="polite" className="px-3 py-1 text-xs text-zinc-300">
+        {stopPending ? 'Morphly stop is unconfirmed. Use Retry Stop before starting again.' : uiStatus}
+        {morphlyBalance && <span className="ml-3">
+          Morphly workspace: {morphlyBalance.available_credits ?? '?'} available ? {morphlyBalance.reserved_credits ?? 0} reserved ? {morphlyBalance.charged_credits ?? 0} charged ? {morphlyBalance.billable_seconds ?? 0}s billed. Final settlement may be pending.
+        </span>}
+      </div>
+      <p id="morphly-model-help" className="px-3 py-1 text-xs text-zinc-300">
+        {selectedModel === 'M2.5'
+          ? 'M2.5 replaces the subject using your reference image (up to 3 MB).'
+          : 'M2.1 uses your garment reference and clothing instructions.'}
+        {' '}Stop the stream before changing models.
+      </p>
       <footer className="relative z-10 flex flex-col gap-1.5 border-t border-white/5 bg-[#0A0A0A] px-2.5 py-1.5 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex flex-wrap items-center gap-1.5">
+          <label htmlFor="morphly-model" className="text-[11px] text-zinc-300">Model</label>
+          <select
+            id="morphly-model"
+            value={selectedModel}
+            aria-describedby="morphly-model-help"
+            disabled={isStreaming || isLoading || stopPending || isStopping}
+            onChange={(event) => {
+              if (startInFlightRef.current || stopInFlightRef.current || retainedMorphlySession || retainedLocalSessionId) return;
+              const model = MORPHLY_MODELS.find((item) => item.id === event.target.value)?.id;
+              if (!model) return;
+              selectedModelRef.current = model;
+              setSelectedModel(model);
+            }}
+            className="h-7 rounded border border-zinc-600 bg-[#1A1A1A] px-1.5 text-[11px] font-medium text-zinc-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {MORPHLY_MODELS.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+          </select>
           <button
             onClick={handleStart}
-            disabled={isStreaming || isLoading}
+            disabled={isStreaming || isLoading || stopPending || isStopping}
             className={`flex h-7 items-center gap-1.5 rounded border px-2.5 transition-all ${
               isStreaming
                 ? 'border-[#133C29] bg-[#122A1F] text-[#22C55E] opacity-50'
@@ -2059,11 +2064,11 @@ function Dashboard() {
 
           <button
             onClick={() => void handleStop()}
-            disabled={!isStreaming}
+            disabled={(!isStreaming && !stopPending) || isStopping}
             className="flex h-7 items-center gap-1.5 rounded border border-[#2A2A2A] bg-[#1E1E1E] px-2.5 text-[#737373] transition-all hover:text-[#A3A3A3] disabled:opacity-50"
           >
             <Square className="h-3 w-3 fill-current opacity-70" />
-            <span className="text-[11px] font-medium">Stop</span>
+            <span className="text-[11px] font-medium">{isStopping ? 'Stopping...' : stopPending ? 'Retry Stop' : 'Stop'}</span>
           </button>
 
           <button

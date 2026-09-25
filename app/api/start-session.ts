@@ -2,13 +2,12 @@
 import { supabaseAdmin, supabaseAdminConfigError } from './supabase.js';
 import { logPaymentActivity } from '../../shared/payment-activity-log.js';
 
+import { sessionOrigin, sessionUser, createMorphlySession } from '../../shared/morphly-session.js';
+import { normalizeMorphlyModel, validateMorphlyReferenceImage, MORPHLY_EDITING_TYPE } from '../../shared/morphly-models.js';
+
 const CREDITS_PER_SECOND = 2;
 const MAX_BILLABLE_SECONDS = 7200;
 const SESSION_BILLING_GRACE_SECONDS = 20;
-
-function getDecartApiKey() {
-  return process.env.DECART_API_KEY?.trim() || null;
-}
 
 function normalizeCredits(value) {
   const credits = Number(value ?? 0);
@@ -88,10 +87,8 @@ async function billAndCloseExistingSession(session, userId, currentCredits) {
 }
 
 export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  
+  const origin = sessionOrigin(req, res);
+  if (!origin) return;
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -100,13 +97,34 @@ export default async function handler(req, res) {
       return res.status(503).json({ allowed: false, error: supabaseAdminConfigError || 'Supabase admin is not configured' });
     }
 
-    const decartApiKey = getDecartApiKey();
-    if (!decartApiKey) {
-      return res.status(503).json({ allowed: false, error: 'Missing DECART_API_KEY in server environment' });
+    if (!process.env.MORPHLY_API_KEY?.trim()) {
+      return res.status(503).json({ allowed: false, error: 'Missing MORPHLY_API_KEY in server environment' });
     }
-
-    const { userId } = req.body;
-    if (!userId) return res.status(400).json({ allowed: false, error: 'User ID is required' });
+    const userId = await sessionUser(req, res, supabaseAdmin);
+    if (!userId) return;
+    const requestedSeconds = req.body?.maxSessionSeconds ?? req.body?.max_session_seconds ?? 300;
+    if (!Number.isInteger(requestedSeconds) || requestedSeconds < 1 || requestedSeconds > 3600) {
+      return res.status(400).json({ error: 'maxSessionSeconds must be an integer between 1 and 3600' });
+    }
+    const model = normalizeMorphlyModel(req.body?.model);
+    if (!model) {
+      return res.status(400).json({ error: 'Unsupported Morphly model' });
+    }
+    const imageUrl = req.body?.image_url;
+    const editingType = req.body?.editing_type ?? MORPHLY_EDITING_TYPE;
+    if (model === 'M2.5') {
+      const imageError = validateMorphlyReferenceImage(imageUrl);
+      if (imageError) return res.status(400).json({ error: imageError, code: 'INVALID_REFERENCE_IMAGE' });
+      if (editingType !== MORPHLY_EDITING_TYPE) {
+        return res.status(400).json({ error: 'M2.5 supports subject_replacement only.', code: 'INVALID_EDITING_TYPE' });
+      }
+    }
+    const { data: claimed, error: limitError } = await supabaseAdmin.rpc('claim_realtime_start', { p_user_id: userId });
+    if (limitError) return res.status(503).json({ error: 'Session rate limiter is unavailable. Apply the Morphly database migration.' });
+    if (!claimed) {
+      res.setHeader('Retry-After', '30');
+      return res.status(429).json({ error: 'Wait 30 seconds before starting another session' });
+    }
 
     await logPaymentActivity(supabaseAdmin, {
       event: 'session_start_requested',
@@ -119,7 +137,7 @@ export default async function handler(req, res) {
     const [activeSessionsResult, walletResult] = await Promise.all([
       supabaseAdmin
         .from('sessions')
-        .select('id, start_time')
+        .select('id, start_time, morphly_expires_at')
         .eq('user_id', userId)
         .eq('status', 'active')
         .order('start_time', { ascending: true }),
@@ -138,6 +156,9 @@ export default async function handler(req, res) {
 
     const existingActiveSessions = activeSessionsResult.data ?? [];
     const walletNow = walletResult.data;
+    if (existingActiveSessions.some((session) => new Date(session.morphly_expires_at).getTime() > Date.now())) {
+      return res.status(409).json({ error: 'An active Morphly session already exists. Stop it before starting again, or wait for its time limit.' });
+    }
 
     let runningCredits = normalizeCredits(walletNow?.credits);
     if (existingActiveSessions && existingActiveSessions.length > 0) {
@@ -185,13 +206,14 @@ export default async function handler(req, res) {
     }
 
     // Expose a deterministic time budget to the client based on current credits.
-    const maxSeconds = Math.floor(userCredits / CREDITS_PER_SECOND) + SESSION_BILLING_GRACE_SECONDS;
+    const maxSeconds = Math.min(requestedSeconds, 3600, Math.floor(userCredits / CREDITS_PER_SECOND) + SESSION_BILLING_GRACE_SECONDS);
 
     const { data: newSession, error: sessionError } = await supabaseAdmin
       .from('sessions')
       .insert({
         user_id: userId,
         status: 'active',
+        morphly_expires_at: new Date(Date.now() + (maxSeconds + 60) * 1000),
         start_time: new Date(),
         credits_used: 0,
         seconds_used: 0,
@@ -217,7 +239,21 @@ export default async function handler(req, res) {
       payload: { sessionId: newSession.id, credits: userCredits, maxSeconds },
     });
 
-    res.json({ allowed: true, sessionId: newSession.id, credits: userCredits, maxSeconds, token: decartApiKey });
+    // Keep the full opaque Morphly response for SDK metering and settlement.
+    let upstream;
+    let payload;
+    try {
+      upstream = await createMorphlySession({ origin, maxSeconds, model, imageUrl, editingType });
+      payload = await upstream.json();
+    } catch {
+      await supabaseAdmin.from('sessions').update({ status: 'ended', end_time: new Date(), seconds_used: 0, credits_used: 0 }).eq('id', newSession.id);
+      return res.status(502).json({ error: 'Morphly session service unavailable. Try Start again later.' });
+    }
+    if (!upstream.ok) {
+      await supabaseAdmin.from('sessions').update({ status: 'ended', end_time: new Date(), seconds_used: 0, credits_used: 0 }).eq('id', newSession.id);
+      return res.status(upstream.status).json(payload);
+    }
+    return res.status(upstream.status).json({ ...payload, allowed: true, sessionId: newSession.id, credits: userCredits, maxSeconds });
   } catch (error) {
     console.error('start-session unexpected error:', error);
     await logPaymentActivity(supabaseAdmin, {

@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import { createDesktopUpdater } from './updater.js';
+import { serveRenderer } from './renderer-server.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -926,7 +927,7 @@ function resolveUpdateManifestUrl() {
 }
 
 function resolveRendererDevUrl() {
-  return process.env.ELECTRON_RENDERER_URL || 'http://localhost:5173';
+  return process.env.ELECTRON_RENDERER_URL || 'http://127.0.0.1:5173';
 }
 
 function buildLoadFailureHtml(failedUrl, errorCode, errorDescription) {
@@ -1133,8 +1134,12 @@ function createWindow() {
   if (isDevelopment) {
     void mainWindow.loadURL(resolveRendererDevUrl());
   } else {
-    const packagedIndexHtml = path.resolve(app.getAppPath(), 'dist', 'index.html');
-    void mainWindow.loadFile(packagedIndexHtml);
+    void serveRenderer(path.resolve(app.getAppPath(), 'dist'))
+      .then((origin) => mainWindow.loadURL(origin))
+      .catch((error) => {
+        console.error('Unable to start the desktop renderer server:', error.message);
+        void mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent('<h1>Unable to start Surevideotool</h1><p>Close other Surevideotool instances and check that port 47831 is available, then restart.</p>')}`);
+      });
   }
 }
 

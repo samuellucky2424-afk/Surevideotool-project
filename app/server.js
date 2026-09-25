@@ -23,9 +23,9 @@ import { logError, logRequest } from '../shared/server-logger.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const decartConfigError = process.env.DECART_API_KEY?.trim()
+const morphlyConfigError = process.env.MORPHLY_API_KEY?.trim()
   ? null
-  : 'Missing DECART_API_KEY';
+  : 'Missing MORPHLY_API_KEY';
 
 // Middleware
 app.use(cors());
@@ -58,6 +58,8 @@ app.use((req, res, next) => {
   next();
 });
 app.use('/api/paymentpoint-webhook', express.raw({ type: '*/*' }), paymentPointWebhookRouter);
+// M2.5 sends its reference image as base64 when requesting a session.
+app.use('/api/start-session', express.json({ limit: '4.5mb' }));
 app.use(express.json());
 
 // API Routes
@@ -83,12 +85,15 @@ app.listen(PORT, () => {
   if (supabaseAdminConfigError) {
     console.warn(`[config] ${supabaseAdminConfigError}`);
   }
-  if (decartConfigError) {
-    console.warn(`[config] ${decartConfigError}`);
+  if (morphlyConfigError) {
+    console.warn(`[config] ${morphlyConfigError}`);
   }
 });
 
 app.use((error, req, res, next) => {
+  if (error.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Reference image is too large. Use an image of 3 MB or smaller.' });
+  }
   logError('express-unhandled-error', error, {
     requestId: req?.requestId,
     method: req?.method,

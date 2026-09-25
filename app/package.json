@@ -1,7 +1,7 @@
 {
   "name": "surevideotool-desktop",
   "private": true,
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "Surevideotool desktop app with bundled virtual camera install flow.",
   "author": "Surevideotool",
   "repository": {
@@ -39,10 +39,6 @@
       "electron/**/*"
     ],
     "extraResources": [
-      {
-        "from": ".env",
-        "to": "."
-      },
       {
         "from": "build/icon.ico",
         "to": "icon.ico"
@@ -88,7 +84,6 @@
     ]
   },
   "dependencies": {
-    "@decartai/sdk": "^0.0.60",
     "@hookform/resolvers": "^5.2.2",
     "@radix-ui/react-accordion": "^1.2.12",
     "@radix-ui/react-alert-dialog": "^1.1.15",
