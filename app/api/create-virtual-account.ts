@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { supabaseAdmin } from './supabase.js';
+import { supabaseAdmin } from './_supabase.js';
 import {
   createPaymentPointVirtualAccount,
   resolvePaymentPointVirtualAccountConfig,

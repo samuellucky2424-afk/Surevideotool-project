@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { supabaseAdmin } from './supabase.js';
+import { supabaseAdmin } from './_supabase.js';
 
 export async function verifyFlutterwaveTransaction(transactionId, secretKey) {
   const response = await fetch(`https://api.flutterwave.com/v3/transactions/${encodeURIComponent(String(transactionId))}/verify`, {

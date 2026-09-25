@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { supabaseAdmin, supabaseAdminConfigError } from './supabase.js';
+import { supabaseAdmin, supabaseAdminConfigError } from './_supabase.js';
 import { logPaymentActivity } from '../shared/payment-activity-log.js';
 
 import { sessionUser } from '../shared/morphly-session.js';

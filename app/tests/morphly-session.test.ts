@@ -61,7 +61,7 @@ test('Morphly requests use fresh idempotency keys and preserve the full opaque r
 });
 
 test('start route enforces limits, forwards provider failures and rolls back local sessions', async (t) => {
-  const { supabaseAdmin } = await import('../api/supabase.ts');
+  const { supabaseAdmin } = await import('../api/_supabase.ts');
   const { default: handler } = await import('../api/start-session.ts');
   const admin = supabaseAdmin!;
   admin.auth.getUser = async () => ({ data: { user: { id: 'user-1' } }, error: null });

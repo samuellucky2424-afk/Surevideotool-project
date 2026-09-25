@@ -18,7 +18,7 @@ import startSessionRouter from './api/start-session.ts';
 import sessionStatusRouter from './api/session-status.ts';
 import endSessionRouter from './api/end-session.ts';
 import versionRouter from './api/version.ts';
-import { supabaseAdminConfigError } from './api/supabase.ts';
+import { supabaseAdminConfigError } from './api/_supabase.ts';
 import { logError, logRequest } from '../shared/server-logger.js';
 
 const app = express();

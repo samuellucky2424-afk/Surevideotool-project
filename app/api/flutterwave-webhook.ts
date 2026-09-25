@@ -1,13 +1,13 @@
 // @ts-nocheck
 import crypto from 'crypto';
 
-import { supabaseAdmin, supabaseAdminConfigError } from './supabase.js';
+import { supabaseAdmin, supabaseAdminConfigError } from './_supabase.js';
 import {
   applyVerifiedFlutterwavePayment,
   extractFlutterwavePaymentContext,
   validateFlutterwaveTransaction,
   verifyFlutterwaveTransaction
-} from './flutterwave-payment.js';
+} from './_flutterwave-payment.js';
 
 function getHeader(req, name) {
   const value = req.headers?.[name] ?? req.headers?.[name.toLowerCase()];

@@ -45,6 +45,8 @@ Vite always writes to this repository's `app/dist`, independent of the build wor
 
 Use the configuration for your selected root. Both use `npm run build:app`. A successful Vite build followed by `No Output Directory named "dist" found` indicates the deployment is looking in the wrong directory; check Root Directory and remove stale Build Command/Output Directory overrides. When deploying from `app`, include source files outside the Root Directory so the existing `../shared` imports are available.
 
+Each API tree contains 11 public handlers. `_supabase.ts` and `_flutterwave-payment.ts` are internal helpers; their underscore prefix prevents Vercel from deploying them as extra functions and keeps the project within the Hobby plan's 12-function limit. Keep new internal helpers prefixed with `_` or outside `api`.
+
 ## Session behavior
 
 - Each Start requests up to five minutes, capped further by the app wallet and Morphly's available balance. Camera changes and frozen streams stop the current session; the user explicitly starts the next one. No automatic paid replacement sessions are created.

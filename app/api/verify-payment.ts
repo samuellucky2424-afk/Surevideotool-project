@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { supabaseAdmin, supabaseAdminConfigError } from './supabase.js';
+import { supabaseAdmin, supabaseAdminConfigError } from './_supabase.js';
 import { findLatestSuccessfulPaymentPointWebhook } from '../../shared/paymentpoint-webhook-cache.js';
 import { logPaymentActivity } from '../../shared/payment-activity-log.js';
 import { logError, logPayment } from '../../shared/server-logger.js';

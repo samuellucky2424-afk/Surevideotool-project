@@ -1,7 +1,7 @@
 // @ts-nocheck
 import crypto from 'crypto';
 
-import { supabaseAdmin, supabaseAdminConfigError } from './supabase.js';
+import { supabaseAdmin, supabaseAdminConfigError } from './_supabase.js';
 import {
   logPaymentActivity,
   parseJsonBody,
