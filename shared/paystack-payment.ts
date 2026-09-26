@@ -31,6 +31,15 @@ export async function paymentUser(req, admin) {
   return data.user;
 }
 
+export function normalizePaymentEmail(value) {
+  const email = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  // Basic format validation only; Paystack also applies its own address rules.
+  if (email.length > 254 || !/^[^\s@<>"\u0000-\u001f]+@[^\s@<>"\u0000-\u001f]+\.[^\s@<>"\u0000-\u001f]+$/.test(email)) {
+    throw new PaymentError('Your account email is not valid for checkout. Please correct your account email or sign in with a valid email address.', 400);
+  }
+  return email;
+}
+
 function safeProviderText(value, secret) {
   if (typeof value !== 'string') return null;
   return value.split(secret).join('[redacted]')
@@ -62,9 +71,13 @@ async function paystackRequest(path, secret, body) {
   const result = await response.json().catch(() => null);
   if (!response.ok || result?.status !== true || !result.data) {
     const providerMessage = safeProviderText(result?.message, secret);
+    const emailRejected = operation === 'initialize' && response.status === 400
+      && /email.*(?:valid|invalid)|invalid.*email/i.test(providerMessage || '');
     const authFailure = response.status === 401 || response.status === 403;
     const invalidResponse = !result || (response.ok && result.status === true && !result.data);
-    const message = authFailure
+    const message = emailRejected
+      ? 'Paystack rejected your account email. Please check the Payment email shown on this page and correct your account email or sign in with a valid email address.'
+      : authFailure
       ? 'Payments are temporarily unavailable. Please contact support.'
       : response.status === 429
         ? 'Paystack is busy. Please wait a moment and try again.'
@@ -72,7 +85,7 @@ async function paystackRequest(path, secret, body) {
           ? 'Paystack is temporarily unavailable. Please try again shortly.'
           : providerMessage ? `Paystack: ${providerMessage}`
             : 'Paystack could not process this request. Please try again.';
-    const error = new PaymentError(message, 502);
+    const error = new PaymentError(message, emailRejected ? 400 : 502);
     // Log only selected diagnostic fields, never headers, keys, or full payloads.
     error.diagnostics = {
       operation, mode, httpStatus: response.status,
@@ -88,6 +101,7 @@ async function paystackRequest(path, secret, body) {
 }
 
 export async function initializePayment(admin, secret, user, planId) {
+  const email = normalizePaymentEmail(user.email);
   if (typeof planId !== 'string' || !/^[0-9a-f-]{36}$/i.test(planId)) {
     throw new PaymentError('Select a valid credit plan');
   }
@@ -107,12 +121,12 @@ export async function initializePayment(admin, secret, user, planId) {
   const reference = `svt-${randomUUID()}`;
   // Persist the trusted price and credit snapshot BEFORE contacting Paystack.
   const { error: insertError } = await admin.from('paystack_orders').insert({
-    reference, user_id: user.id, email: user.email.toLowerCase(), plan_id: plan.id,
+    reference, user_id: user.id, email, plan_id: plan.id,
     plan_name: plan.name?.trim() || `${credits} Credits`, credits, amount_kobo: amountKobo, currency: 'NGN',
   });
   if (insertError) throw insertError;
   const data = await paystackRequest('/transaction/initialize', secret, {
-    email: user.email, amount: amountKobo, currency: 'NGN', reference,
+    email, amount: amountKobo, currency: 'NGN', reference,
     metadata: JSON.stringify({ user_id: user.id, plan_id: plan.id }),
   });
   if (!data.access_code || data.reference !== reference) {
@@ -133,7 +147,7 @@ export function validateTransaction(transaction, order) {
       || transaction.amount !== Number(order.amount_kobo)) {
     throw new PaymentError('Payment amount or currency does not match the order');
   }
-  if (transaction.customer?.email?.toLowerCase() !== order.email.toLowerCase()) {
+  if (transaction.customer?.email?.trim().toLowerCase() !== order.email.trim().toLowerCase()) {
     throw new PaymentError('Payment customer does not match the order');
   }
   return true;
@@ -185,7 +199,7 @@ export async function readWebhookBody(req) {
 
 export function paymentResponseError(res, error) {
   const statusCode = error instanceof PaymentError ? error.statusCode : 500;
-  if (statusCode >= 500) console.error('[paystack]', error.diagnostics
+  if (statusCode >= 500 || error.diagnostics) console.error('[paystack]', error.diagnostics
     ? JSON.stringify({ message: error.message, ...error.diagnostics }) : error.message);
   return res.status(statusCode).json({ status: 'failed', message: statusCode === 500
     ? 'Unable to process payment right now. Please try again.' : error.message });

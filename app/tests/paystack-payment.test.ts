@@ -27,11 +27,11 @@ function response() {
   };
 }
 
-function adminStub(options: { userId?: string; insertError?: object; rpcError?: object } = {}) {
+function adminStub(options: { userId?: string; email?: string; insertError?: object; rpcError?: object } = {}) {
   const inserts: any[] = [];
   const rpcCalls: any[] = [];
   const admin = {
-    auth: { getUser: async () => ({ data: { user: { id: options.userId || userId, email: order.email } }, error: null }) },
+    auth: { getUser: async () => ({ data: { user: { id: options.userId || userId, email: options.email ?? order.email } }, error: null }) },
     from(table: string) {
       return {
         select() { return this; }, eq() { return this; },
@@ -130,6 +130,46 @@ test('database failure prevents checkout from starting', async (t) => {
   await createInitializeHandler(admin)({ method: 'POST', headers: { authorization: 'Bearer token' }, body: { planId } }, res);
   assert.equal(res.statusCode, 500);
   assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('checkout normalizes the authenticated email consistently in the order and Paystack request', async (t) => {
+  const { admin, inserts } = adminStub({ email: '  Buyer@Example.COM  ' });
+  t.mock.method(globalThis, 'fetch', async (_url: string, init: any) => {
+    const body = JSON.parse(init.body);
+    assert.equal(body.email, 'buyer@example.com');
+    return new Response(JSON.stringify({ status: true, data: { access_code: 'code', reference: body.reference } }));
+  });
+  const res = response();
+  await createInitializeHandler(admin)({ method: 'POST', headers: { authorization: 'Bearer token' }, body: { planId } }, res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(inserts[0].email, 'buyer@example.com');
+});
+
+test('malformed account email fails before creating an order or calling Paystack', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('must not call Paystack'); });
+  for (const email of ['buyer', 'buyer@example', 'buyer @example.com', 'buyer@@example.com', '<buyer@example.com>']) {
+    const { admin, inserts } = adminStub({ email });
+    const res = response();
+    await createInitializeHandler(admin)({ method: 'POST', headers: { authorization: 'Bearer token' }, body: { planId } }, res);
+    assert.equal(res.statusCode, 400);
+    assert.match(res.body.message, /account email/);
+    assert.equal(inserts.length, 0);
+  }
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('Paystack email rejection gives an actionable account error, preserving provider diagnostics', async (t) => {
+  const { admin, rpcCalls } = adminStub();
+  const logs = t.mock.method(console, 'error', () => {});
+  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({
+    status: false, code: 'invalid_params', message: '"email" must be a valid email',
+  }), { status: 400 }));
+  const res = response();
+  await createInitializeHandler(admin)({ method: 'POST', headers: { authorization: 'Bearer token' }, body: { planId } }, res);
+  assert.equal(res.statusCode, 400);
+  assert.match(res.body.message, /Paystack rejected your account email/);
+  assert.equal(JSON.parse(logs.mock.calls[0].arguments[1] as string).providerMessage, '"email" must be a valid email');
+  assert.equal(rpcCalls.length, 0);
 });
 
 test('wrong key format fails before calling Paystack and never exposes the configured value', async (t) => {
