@@ -12,6 +12,14 @@ export function paymentConfig(admin) {
   if (!admin) throw new PaymentError('Payment database is not configured', 503);
   const secret = process.env.PAYSTACK_SECRET_KEY?.trim();
   if (!secret) throw new PaymentError('Paystack is not configured', 503);
+  if (!/^sk_(test|live)_[^\s"']+$/.test(secret)) {
+    const error = new PaymentError('Payments are temporarily unavailable. Please contact support.', 503);
+    error.diagnostics = {
+      operation: 'configuration', code: 'invalid_secret_key_format',
+      nextStep: 'Set PAYSTACK_SECRET_KEY to a Paystack secret key (sk_test_ or sk_live_), without quotes or a Bearer prefix, then redeploy.',
+    };
+    throw error;
+  }
   return secret;
 }
 
@@ -23,16 +31,58 @@ export async function paymentUser(req, admin) {
   return data.user;
 }
 
+function safeProviderText(value, secret) {
+  if (typeof value !== 'string') return null;
+  return value.split(secret).join('[redacted]')
+    .replace(/\b(?:sk|pk)_(?:live|test)_[a-z0-9_-]+/gi, '[redacted key]')
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted email]')
+    .replace(/[\r\n\t]/g, ' ').slice(0, 500);
+}
+
 async function paystackRequest(path, secret, body) {
-  const response = await fetch(`https://api.paystack.co${path}`, {
-    method: body ? 'POST' : 'GET',
-    headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-    signal: AbortSignal.timeout(15000),
-  });
+  const operation = body ? 'initialize' : 'verify';
+  const mode = secret.startsWith('sk_live_') ? 'live' : 'test';
+  let response;
+  try {
+    response = await fetch(`https://api.paystack.co${path}`, {
+      method: body ? 'POST' : 'GET',
+      headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (cause) {
+    const timedOut = cause?.name === 'TimeoutError' || cause?.name === 'AbortError';
+    const error = new PaymentError(timedOut
+      ? 'Paystack took too long to respond. Please try again.'
+      : 'Unable to connect to Paystack. Please try again.', timedOut ? 504 : 502);
+    error.diagnostics = { operation, mode, code: timedOut ? 'upstream_timeout' : 'upstream_connection_error' };
+    throw error;
+  }
   const result = await response.json().catch(() => null);
   if (!response.ok || result?.status !== true || !result.data) {
-    throw new PaymentError('Paystack could not process this request. Please try again.', 502);
+    const providerMessage = safeProviderText(result?.message, secret);
+    const authFailure = response.status === 401 || response.status === 403;
+    const invalidResponse = !result || (response.ok && result.status === true && !result.data);
+    const message = authFailure
+      ? 'Payments are temporarily unavailable. Please contact support.'
+      : response.status === 429
+        ? 'Paystack is busy. Please wait a moment and try again.'
+        : response.status >= 500 || invalidResponse
+          ? 'Paystack is temporarily unavailable. Please try again shortly.'
+          : providerMessage ? `Paystack: ${providerMessage}`
+            : 'Paystack could not process this request. Please try again.';
+    const error = new PaymentError(message, 502);
+    // Log only selected diagnostic fields, never headers, keys, or full payloads.
+    error.diagnostics = {
+      operation, mode, httpStatus: response.status,
+      code: safeProviderText(result?.code, secret) || (invalidResponse ? 'invalid_upstream_response' : 'upstream_rejected'),
+      providerMessage,
+      nextStep: authFailure
+        ? 'Check the Production PAYSTACK_SECRET_KEY in Vercel against the correct Paystack business and mode, then redeploy.'
+        : safeProviderText(result?.meta?.next_step, secret),
+    };
+    throw error;
   }
   return result.data;
 }
@@ -63,7 +113,7 @@ export async function initializePayment(admin, secret, user, planId) {
   if (insertError) throw insertError;
   const data = await paystackRequest('/transaction/initialize', secret, {
     email: user.email, amount: amountKobo, currency: 'NGN', reference,
-    metadata: { user_id: user.id, plan_id: plan.id },
+    metadata: JSON.stringify({ user_id: user.id, plan_id: plan.id }),
   });
   if (!data.access_code || data.reference !== reference) {
     throw new PaymentError('Paystack returned an invalid checkout session', 502);
@@ -135,7 +185,8 @@ export async function readWebhookBody(req) {
 
 export function paymentResponseError(res, error) {
   const statusCode = error instanceof PaymentError ? error.statusCode : 500;
-  if (statusCode >= 500) console.error('[paystack]', error.message);
+  if (statusCode >= 500) console.error('[paystack]', error.diagnostics
+    ? JSON.stringify({ message: error.message, ...error.diagnostics }) : error.message);
   return res.status(statusCode).json({ status: 'failed', message: statusCode === 500
     ? 'Unable to process payment right now. Please try again.' : error.message });
 }

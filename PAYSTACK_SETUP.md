@@ -36,3 +36,15 @@ Run `npm run test:payments --prefix app` and `npm run build:app --prefix app`.
 After deployment, use a signed-in account and Paystack test mode to complete a credit purchase. Verify the wallet and transaction history, then resend the same webhook from Paystack and confirm credits do not increase again. Check cancellation and the **Check payment status** button. Live payments and dashboard configuration require your own Paystack credentials.
 
 References: [Paystack InlineJS](https://paystack.com/docs/developer-tools/inlinejs/), [webhook signatures and retries](https://paystack.com/docs/payments/webhooks/), [transaction verification](https://paystack.com/docs/payments/verify-payments/).
+
+## Troubleshooting rejected API requests
+
+Vercel `[paystack]` error logs include the operation (`initialize` or `verify`), test/live mode, upstream HTTP status, Paystack error code, sanitized message and suggested next step. They do not log API keys or full Paystack response payloads.
+
+- `invalid_secret_key_format`: set the server variable `PAYSTACK_SECRET_KEY` to the secret key beginning `sk_test_` or `sk_live_`. Do not use a public `pk_` key, quotes, or a `Bearer ` prefix.
+- HTTP `401` / `403`: verify that Vercel's **Production** environment has the correct active secret key for your Paystack business. Redeploy after changing environment variables. A well-formed key can still be revoked or belong to the wrong account.
+- Validation or merchant errors: use the logged `providerMessage` / `nextStep` to check the specific account or transaction restriction. Do not assume every rejection is an invalid key.
+- `Transaction not found`: verify that the reference belongs to the same Paystack business and test/live mode as the deployed key. Switching keys after initializing a transaction can prevent verification.
+- HTTP `429`, `5xx`, connection errors or timeouts: retry later. When a payment was already made, use **Check payment status** to verify the existing reference before paying again.
+
+Share the sanitized diagnostic log when investigating a failure; never share your secret key. See [Paystack API errors](https://paystack.com/docs/api/errors/).

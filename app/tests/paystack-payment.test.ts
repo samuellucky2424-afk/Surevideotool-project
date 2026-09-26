@@ -108,7 +108,8 @@ test('checkout uses the authenticated user and server plan price in kobo, ignori
     const body = JSON.parse(init.body);
     assert.equal(body.amount, 1150000);
     assert.equal(body.email, order.email);
-    assert.equal(body.metadata.user_id, userId);
+    assert.equal(typeof body.metadata, 'string');
+    assert.deepEqual(JSON.parse(body.metadata), { user_id: userId, plan_id: planId });
     assert.equal(init.headers.Authorization, `Bearer ${secret}`);
     return new Response(JSON.stringify({ status: true, data: { access_code: 'test-access-code', reference: body.reference } }));
   });
@@ -129,6 +130,82 @@ test('database failure prevents checkout from starting', async (t) => {
   await createInitializeHandler(admin)({ method: 'POST', headers: { authorization: 'Bearer token' }, body: { planId } }, res);
   assert.equal(res.statusCode, 500);
   assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('wrong key format fails before calling Paystack and never exposes the configured value', async (t) => {
+  const previousKey = process.env.PAYSTACK_SECRET_KEY;
+  t.after(() => { process.env.PAYSTACK_SECRET_KEY = previousKey; });
+  const logs = t.mock.method(console, 'error', () => {});
+  const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('must not call Paystack'); });
+  for (const key of ['pk_live_private_fixture', 'Bearer sk_live_private_fixture', '"sk_live_private_fixture"']) {
+    process.env.PAYSTACK_SECRET_KEY = key;
+    const { admin, inserts } = adminStub();
+    const res = response();
+    await createInitializeHandler(admin)({ method: 'POST', headers: { authorization: 'Bearer token' }, body: { planId } }, res);
+    assert.equal(res.statusCode, 503);
+    assert.equal(inserts.length, 0);
+    assert.equal(JSON.stringify(res.body).includes('private_fixture'), false);
+  }
+  assert.equal(fetch.mock.callCount(), 0);
+  const logged = JSON.stringify(logs.mock.calls.map(call => call.arguments));
+  assert.ok(logged.includes('invalid_secret_key_format'));
+  assert.equal(logged.includes('private_fixture'), false);
+});
+
+test('Paystack rejection logs status and reason without keys, email or full response payload', async (t) => {
+  const { admin } = adminStub();
+  const logs = t.mock.method(console, 'error', () => {});
+  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({
+    status: false, code: 'invalid_key', message: `Invalid key ${secret} for buyer@example.com`,
+    data: { authorization: 'private-authorization-code' }, meta: { next_step: 'Regenerate your key' },
+  }), { status: 401 }));
+  const res = response();
+  await createInitializeHandler(admin)({ method: 'POST', headers: { authorization: 'Bearer token' }, body: { planId } }, res);
+  assert.equal(res.statusCode, 502);
+  const logged = JSON.parse(logs.mock.calls[0].arguments[1] as string);
+  assert.equal(logged.httpStatus, 401);
+  assert.equal(logged.operation, 'initialize');
+  assert.equal(logged.code, 'invalid_key');
+  assert.equal(logged.providerMessage, 'Invalid key [redacted] for [redacted email]');
+  const exposed = JSON.stringify([logged, res.body]);
+  for (const privateValue of [secret, order.email, 'private-authorization-code']) {
+    assert.equal(exposed.includes(privateValue), false);
+  }
+});
+
+test('Paystack validation reason reaches the client and verification failures never award credits', async (t) => {
+  const { admin, rpcCalls } = adminStub();
+  const logs = t.mock.method(console, 'error', () => {});
+  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({
+    status: false, code: 'transaction_not_found', message: 'Transaction not found',
+    meta: { next_step: 'Check that the reference and API key belong to the same business.' },
+  }), { status: 404 }));
+  const res = response();
+  await createVerifyHandler(admin)({ method: 'POST', headers: { authorization: 'Bearer token' }, body: { reference } }, res);
+  assert.equal(res.statusCode, 502);
+  assert.equal(res.body.message, 'Paystack: Transaction not found');
+  assert.equal(rpcCalls.length, 0);
+  const logged = JSON.parse(logs.mock.calls[0].arguments[1] as string);
+  assert.equal(logged.operation, 'verify');
+  assert.equal(logged.httpStatus, 404);
+  assert.ok(logged.nextStep.includes('same business'));
+});
+
+test('non-JSON provider errors remain safe and distinguishable from network timeouts', async (t) => {
+  const { admin } = adminStub();
+  const logs = t.mock.method(console, 'error', () => {});
+  const fetch = t.mock.method(globalThis, 'fetch', async () => new Response('<html>private upstream dump</html>', { status: 503 }));
+  const req = { method: 'POST', headers: { authorization: 'Bearer token' }, body: { planId } };
+  const res = response();
+  await createInitializeHandler(admin)(req, res);
+  assert.equal(res.statusCode, 502);
+  assert.equal(JSON.parse(logs.mock.calls[0].arguments[1] as string).code, 'invalid_upstream_response');
+  assert.equal(JSON.stringify(logs.mock.calls).includes('private upstream dump'), false);
+  fetch.mock.mockImplementation(async () => { throw new DOMException('Timed out', 'TimeoutError'); });
+  const timeout = response();
+  await createInitializeHandler(admin)(req, timeout);
+  assert.equal(timeout.statusCode, 504);
+  assert.equal(JSON.parse(logs.mock.calls[1].arguments[1] as string).code, 'upstream_timeout');
 });
 
 test('verification rejects another user before calling Paystack', async (t) => {
