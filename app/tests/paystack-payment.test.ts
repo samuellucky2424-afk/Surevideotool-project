@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
 import {
-  createInitializeHandler, createVerifyHandler, createWebhookHandler,
+  createInitializeHandler, createVerifyHandler, createWebhookHandler, createPaymentHandler,
   readWebhookBody, validateTransaction, validWebhookSignature,
 } from '../../shared/paystack-payment.ts';
 
@@ -47,6 +47,48 @@ function adminStub(options: { userId?: string; insertError?: object; rpcError?: 
   };
   return { admin, inserts, rpcCalls };
 }
+
+test('both Vercel roots stay within the Hobby function limit and preserve payment URLs', async () => {
+  for (const root of ['../../', '../']) {
+    const files = await readdir(new URL(`${root}api/`, import.meta.url));
+    const endpoints = files.filter(name => name.endsWith('.ts') && !name.startsWith('_'));
+    assert.ok(endpoints.length <= 12, `${root} has ${endpoints.length} deployed functions`);
+    assert.ok(endpoints.includes('payments.ts'));
+    assert.ok(endpoints.includes('paystack-webhook.ts'));
+    const config = JSON.parse(await readFile(new URL(`${root}vercel.json`, import.meta.url), 'utf8'));
+    assert.deepEqual(config.rewrites.slice(0, 2), [
+      { source: '/api/initialize-payment', destination: '/api/payments?action=initialize' },
+      { source: '/api/verify-payment', destination: '/api/payments?action=verify' },
+    ]);
+  }
+});
+
+test('combined payment function routes initialization and verification with authentication intact', async (t) => {
+  const { admin, rpcCalls, inserts } = adminStub();
+  const handler = createPaymentHandler(admin);
+  t.mock.method(globalThis, 'fetch', async (url: string, init: any) => {
+    if (url.endsWith('/initialize')) {
+      return new Response(JSON.stringify({ status: true, data: {
+        access_code: 'test-access-code', reference: JSON.parse(init.body).reference,
+      } }));
+    }
+    return new Response(JSON.stringify({ status: true, data: transaction }));
+  });
+  for (const action of ['initialize', 'verify']) {
+    const unauthorized = response();
+    await handler({ method: 'POST', headers: {}, query: { action }, body: { planId, reference } }, unauthorized);
+    assert.equal(unauthorized.statusCode, 401);
+    const res = response();
+    await handler({ method: 'POST', headers: { authorization: 'Bearer token' }, query: { action }, body: { planId, reference } }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.status, 'success');
+  }
+  assert.equal(inserts.length, 1);
+  assert.equal(rpcCalls.length, 1);
+  const invalid = response();
+  await handler({ method: 'POST', headers: {}, query: { action: 'unknown' } }, invalid);
+  assert.equal(invalid.statusCode, 404);
+});
 
 test('checkout requires login and CORS preflight does not initialize payment', async () => {
   const { admin, inserts } = adminStub();

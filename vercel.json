@@ -7,11 +7,12 @@
   "installCommand": "npm ci",
   "functions": {
     "api/**/*.ts": {
-      "memory": 1024,
       "maxDuration": 30
     }
   },
   "rewrites": [
+    { "source": "/api/initialize-payment", "destination": "/api/payments?action=initialize" },
+    { "source": "/api/verify-payment", "destination": "/api/payments?action=verify" },
     { "source": "/api/(.*)", "destination": "/api/$1" }
   ],
   "headers": [

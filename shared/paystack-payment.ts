@@ -173,6 +173,18 @@ export function createVerifyHandler(admin) {
   };
 }
 
+// Vercel rewrites keep the public URLs while sharing one deployed function.
+export function createPaymentHandler(admin) {
+  const initialize = createInitializeHandler(admin);
+  const verify = createVerifyHandler(admin);
+  return async (req, res) => {
+    if (req.query?.action === 'initialize') return initialize(req, res);
+    if (req.query?.action === 'verify') return verify(req, res);
+    if (!paymentCors(req, res)) return;
+    return res.status(404).json({ status: 'failed', message: 'Unknown payment action' });
+  };
+}
+
 export function createWebhookHandler(admin) {
   return async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');

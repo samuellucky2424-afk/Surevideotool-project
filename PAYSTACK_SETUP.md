@@ -25,6 +25,8 @@ No frontend public key or separate webhook secret is needed in this integration.
 
 Both confirmation paths use the same database transaction. Order locking prevents duplicate credits. Wallet changes, transaction history, subscription history and paid status either all commit or all roll back. Database/provider failures return a non-200 response so Paystack can retry.
 
+Vercel rewrites route initialization and verification through one `payments` function. This keeps each deployment root at the Hobby limit of 12 functions. The Paystack webhook remains a separate function with raw-body parsing. Files prefixed with `_` are local handlers/helpers, not deployed endpoints.
+
 The old provider webhook routes are retained for outstanding legacy payments. New purchases use Paystack, and `/api/verify-payment` now expects a Paystack reference. Older desktop versions using PaymentPoint should be upgraded.
 
 ## Verification
