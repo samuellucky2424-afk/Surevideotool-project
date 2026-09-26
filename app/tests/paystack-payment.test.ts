@@ -27,7 +27,7 @@ function response() {
   };
 }
 
-function adminStub(options: { userId?: string; email?: string; insertError?: object; rpcError?: object } = {}) {
+function adminStub(options: { userId?: string; email?: string; insertError?: object; rpcError?: object; priceNGN?: number } = {}) {
   const inserts: any[] = [];
   const rpcCalls: any[] = [];
   const admin = {
@@ -36,7 +36,7 @@ function adminStub(options: { userId?: string; email?: string; insertError?: obj
       return {
         select() { return this; }, eq() { return this; },
         maybeSingle: async () => ({ data: table === 'plans'
-          ? { id: planId, name: 'Starter', credits: 500, usd_price: 10 } : order, error: null }),
+          ? { id: planId, name: 'Starter', credits: 500, usd_price: 10, price_ngn: options.priceNGN } : order, error: null }),
         insert: async (payload: any) => { inserts.push(payload); return { error: options.insertError || null }; },
       };
     },
@@ -121,6 +121,35 @@ test('checkout uses the authenticated user and server plan price in kobo, ignori
   assert.equal(inserts[0].credits, 500);
   assert.equal(inserts[0].user_id, userId);
   assert.equal(JSON.stringify(res.body).includes(secret), false);
+});
+
+test('custom Naira prices reach Paystack unchanged, including 100 and fractional amounts', async (t) => {
+  for (const amount of [100, 100.50, 0.29, 999, 1000, 11500]) {
+    const { admin, inserts } = adminStub({ priceNGN: amount });
+    t.mock.method(globalThis, 'fetch', async (_url: string, init: any) => {
+      const body = JSON.parse(init.body);
+      assert.equal(body.amount, Math.round(amount * 100));
+      return new Response(JSON.stringify({ status: true, data: { access_code: 'code', reference: body.reference } }));
+    });
+    const res = response();
+    await createInitializeHandler(admin)({ method: 'POST', headers: { authorization: 'Bearer token' }, body: { planId, amountNGN: 1 } }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.amountNGN, amount);
+    assert.equal(inserts[0].amount_kobo, Math.round(amount * 100));
+    t.mock.restoreAll();
+  }
+});
+
+test('invalid explicit Naira prices cannot fall back to an old price or start checkout', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('must not call Paystack'); });
+  for (const priceNGN of [0, -100, NaN, Infinity, 100.001]) {
+    const { admin, inserts } = adminStub({ priceNGN });
+    const res = response();
+    await createInitializeHandler(admin)({ method: 'POST', headers: { authorization: 'Bearer token' }, body: { planId } }, res);
+    assert.equal(res.statusCode, 400);
+    assert.equal(inserts.length, 0);
+  }
+  assert.equal(fetch.mock.callCount(), 0);
 });
 
 test('database failure prevents checkout from starting', async (t) => {

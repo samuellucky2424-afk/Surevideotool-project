@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { resolveStoredPlanPriceNGN } from './plan-pricing.js';
 
 export class PaymentError extends Error {
   constructor(message, statusCode = 400) {
@@ -106,13 +107,11 @@ export async function initializePayment(admin, secret, user, planId) {
     throw new PaymentError('Select a valid credit plan');
   }
   const { data: plan, error } = await admin.from('plans')
-    .select('id,name,credits,usd_price').eq('id', planId).maybeSingle();
+    .select('*').eq('id', planId).maybeSingle();
   if (error) throw error;
   if (!plan) throw new PaymentError('This credit plan is no longer available');
-  const storedPrice = Number(plan.usd_price);
-  // Match the existing pricing display, including legacy USD-style rows.
-  const amountNGN = Math.round(storedPrice < 1000 ? storedPrice * 1150 : storedPrice);
-  const amountKobo = amountNGN * 100;
+  const amountNGN = resolveStoredPlanPriceNGN(plan.usd_price, plan.price_ngn);
+  const amountKobo = Math.round(amountNGN * 100);
   const credits = Number(plan.credits);
   if (!Number.isSafeInteger(amountKobo) || amountKobo <= 0
       || !Number.isSafeInteger(credits) || credits <= 0) {

@@ -22,12 +22,13 @@ type SupabasePlan = {
   name: string | null;
   credits: number | string | null;
   usd_price: number | string | null;
+  price_ngn?: number | string | null;
   created_at?: string | null;
 };
 
 function normalizePlan(plan: SupabasePlan): CreditPlan | null {
   const credits = Math.max(0, Math.floor(Number(plan.credits) || 0));
-  const priceNGN = resolveStoredPlanPriceNGN(plan.usd_price);
+  const priceNGN = resolveStoredPlanPriceNGN(plan.usd_price, plan.price_ngn);
 
   if (!plan.id || credits <= 0 || priceNGN <= 0) {
     return null;
@@ -86,9 +87,8 @@ function Subscription() {
       try {
         const { data, error } = await supabase
           .from('plans')
-          .select('id,name,credits,usd_price,created_at')
+          .select('*')
           .gt('credits', 0)
-          .gt('usd_price', 0)
           .order('credits', { ascending: true });
 
         if (error) {

@@ -26,7 +26,7 @@
     "electron:build": "npm run icons && npm run clean:build && npm run build:app && electron-builder --win --publish never",
     "electron:build:dir": "npm run icons && npm run clean:build && npm run build:app && electron-builder --win dir",
     "electron:release": "npm run icons && npm run clean:build && npm run build:app && electron-builder --win --publish always",
-    "test:payments": "tsx --test tests/paystack-payment.test.ts"
+    "test:payments": "tsx --test tests/paystack-payment.test.ts tests/plan-pricing.test.ts"
   },
   "build": {
     "appId": "com.surevideotool.app",

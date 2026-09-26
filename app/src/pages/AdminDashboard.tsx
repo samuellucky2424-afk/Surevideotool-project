@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/context/AuthContext';
 import { ROUTES } from '@/lib/routes';
-import { formatNaira, resolveStoredPlanPriceNGN } from '@/lib/pricing';
+import { formatNaira, resolveStoredPlanPriceNGN, validPlanPriceNGN } from '@/lib/pricing';
 import { BrandIcon } from '@/components/BrandIcon';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -32,8 +32,9 @@ interface Plan {
   id: string;
   name: string;
   credits: number;
-  // The live database/RPC still uses the legacy usd_price name, but the value is now entered and shown as NGN.
+  // Legacy rows remain readable until their first edit.
   usd_price: number;
+  price_ngn?: number | null;
   created_at?: string;
 }
 
@@ -221,19 +222,25 @@ export default function AdminDashboard() {
   };
   const openPlanEdit = (p: Plan) => {
     setEditingPlan(p);
-    setPlanForm({ name: p.name, credits: String(p.credits), price_ngn: String(resolveStoredPlanPriceNGN(p.usd_price)) });
+    setPlanForm({ name: p.name, credits: String(p.credits), price_ngn: String(resolveStoredPlanPriceNGN(p.usd_price, p.price_ngn)) });
     setPlanOpen(true);
   };
   const submitPlan = async () => {
-    const credits = Math.max(0, Math.floor(Number(planForm.credits) || 0));
-    const priceNGN = Math.max(0, Number(planForm.price_ngn) || 0);
+    const credits = Number(planForm.credits);
+    const priceNGN = Number(planForm.price_ngn);
     if (!planForm.name.trim()) { toast.error('Name required'); return; }
+    if (!Number.isSafeInteger(credits) || credits <= 0 || credits > 2147483647) {
+      toast.error('Credits must be a positive whole number'); return;
+    }
+    if (!validPlanPriceNGN(planForm.price_ngn)) {
+      toast.error('Enter a price from ₦0.01 to ₦99,999,999.99, with up to two decimal places'); return;
+    }
 
-    const { error } = await supabase.rpc('admin_upsert_plan', {
+    const { error } = await supabase.rpc('admin_upsert_plan_ngn', {
       p_id: editingPlan?.id ?? null,
       p_name: planForm.name.trim(),
       p_credits: credits,
-      p_usd_price: priceNGN,
+      p_price_ngn: priceNGN,
     });
     if (error) { toast.error('Failed: ' + error.message); return; }
     toast.success(editingPlan ? 'Plan updated' : 'Plan created');
@@ -480,7 +487,7 @@ export default function AdminDashboard() {
                         <TableRow key={p.id} className="border-slate-100 hover:bg-slate-50/60">
                           <TableCell className="py-2.5 text-xs font-medium text-slate-900">{p.name}</TableCell>
                           <TableCell className="py-2.5 text-right text-xs font-medium tabular-nums text-slate-700">{p.credits}</TableCell>
-                          <TableCell className="py-2.5 text-right text-xs font-medium tabular-nums text-slate-700">{formatNaira(resolveStoredPlanPriceNGN(p.usd_price))}</TableCell>
+                          <TableCell className="py-2.5 text-right text-xs font-medium tabular-nums text-slate-700">{formatNaira(resolveStoredPlanPriceNGN(p.usd_price, p.price_ngn))}</TableCell>
                           <TableCell className="py-2.5 text-right">
                             <div className="inline-flex flex-wrap justify-end gap-1.5">
                               <Button
@@ -623,10 +630,11 @@ export default function AdminDashboard() {
                 onChange={(e) => setPlanForm({ ...planForm, credits: e.target.value })} />
             </div>
             <div>
-              <Label className="text-xs font-medium text-slate-700">Price (NGN)</Label>
-              <Input type="number" min={0} step="1" value={planForm.price_ngn}
+              <Label htmlFor="plan-price" className="text-xs font-medium text-slate-700">Price (NGN)</Label>
+              <Input id="plan-price" aria-describedby="plan-price-help" type="number" min="0.01" max="99999999.99" step="0.01" value={planForm.price_ngn}
                 className="mt-1.5 h-8 rounded-md border-slate-300 bg-white text-xs"
                 onChange={(e) => setPlanForm({ ...planForm, price_ngn: e.target.value })} />
+              <p id="plan-price-help" className="mt-1.5 text-xs text-slate-500">Enter the Naira amount, for example 100 for ₦100. Up to two decimal places.</p>
             </div>
           </div>
           <DialogFooter>
